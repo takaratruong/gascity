@@ -27,6 +27,11 @@ type countingMetadataStore struct {
 	batchCalls  int
 }
 
+type sessionGetSpyStore struct {
+	beads.Store
+	getIDs []string
+}
+
 type failingCloseStore struct {
 	*beads.MemStore
 }
@@ -47,6 +52,11 @@ func (s *countingMetadataStore) SetMetadata(id, key, value string) error {
 func (s *countingMetadataStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	s.batchCalls++
 	return s.MemStore.SetMetadataBatch(id, kvs)
+}
+
+func (s *sessionGetSpyStore) Get(id string) (beads.Bead, error) {
+	s.getIDs = append(s.getIDs, id)
+	return s.Store.Get(id)
 }
 
 // allConfiguredDS builds configuredNames from a desiredState map.
@@ -107,6 +117,52 @@ func TestSyncSessionBeads_CreatesNewBeads(t *testing.T) {
 	}
 	if b.Metadata["instance_token"] == "" {
 		t.Error("instance_token is empty")
+	}
+}
+
+func TestSyncSessionBeads_ExistingDesiredUsesSnapshotStateWithoutWorkerLookup(t *testing.T) {
+	base := beads.NewMemStore()
+	store := &sessionGetSpyStore{Store: base}
+	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 22, 0, 0, 0, time.UTC)}
+	sessionBead, err := store.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":       "control-dispatcher",
+			"agent_name":         "control-dispatcher",
+			"template":           "control-dispatcher",
+			"command":            "claude",
+			"state":              string(session.StateActive),
+			"generation":         "1",
+			"continuation_epoch": "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	ds := map[string]TemplateParams{
+		"control-dispatcher": {TemplateName: "control-dispatcher", Command: "claude"},
+	}
+	sp := runtime.NewFake()
+
+	var stderr bytes.Buffer
+	syncSessionBeadsWithSnapshot(
+		"", store, ds, sp, allConfiguredDS(ds), nil, clk, &stderr, false,
+		newSessionBeadSnapshot([]beads.Bead{sessionBead}),
+	)
+	if stderr.Len() > 0 {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+	for _, id := range store.getIDs {
+		if id == "control-dispatcher" {
+			t.Fatalf("sync looked up configured session name as bead id; getIDs=%v", store.getIDs)
+		}
+	}
+	for _, call := range sp.Calls {
+		switch call.Method {
+		case "IsRunning", "ProcessAlive", "IsAttached", "GetLastActivity", "GetMeta":
+			t.Fatalf("sync should trust the session snapshot for existing desired sessions, saw provider call %#v", call)
+		}
 	}
 }
 

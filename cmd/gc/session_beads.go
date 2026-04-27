@@ -55,6 +55,28 @@ func snapshotOrLoadSessionBeads(store beads.Store, sessionBeads *sessionBeadSnap
 	return loadSessionBeads(store)
 }
 
+func syncSessionCachedState(sessionName string, existing beads.Bead, exists bool, sp runtime.Provider) string {
+	if exists {
+		switch session.State(strings.TrimSpace(existing.Metadata["state"])) {
+		case "", session.StateActive, session.StateAwake:
+			return string(session.StateActive)
+		case session.StateCreating:
+			return string(session.StateCreating)
+		case session.StateAsleep, session.StateSuspended, session.StateDraining, session.StateArchived, session.StateQuarantined:
+			return strings.TrimSpace(existing.Metadata["state"])
+		default:
+			if state := strings.TrimSpace(existing.Metadata["state"]); state != "" {
+				return state
+			}
+			return string(session.StateActive)
+		}
+	}
+	if sp != nil && strings.TrimSpace(sessionName) != "" && sp.IsRunning(sessionName) {
+		return string(session.StateActive)
+	}
+	return "stopped"
+}
+
 func stampResolvedProviderSessionMetadata(meta map[string]string, resolved *config.ResolvedProvider) {
 	if meta == nil || resolved == nil {
 		return
@@ -612,13 +634,6 @@ func syncSessionBeadsWithSnapshot(
 		isConfiguredNamed := strings.TrimSpace(tp.ConfiguredNamedIdentity) != ""
 		origin := templateParamsSessionOrigin(tp)
 
-		// Use provider for liveness check (includes zombie detection).
-		state := "stopped"
-		alive, _ := workerSessionTargetAliveWithConfig(store, sp, cfg, sn, tp.Hints.ProcessNames)
-		if alive {
-			state = "active"
-		}
-
 		agentName := tp.TemplateName
 		// For pool instances, use the qualified instance name as the agent_name.
 		if slot := resolvePoolSlot(tp.InstanceName, tp.TemplateName); slot > 0 {
@@ -629,10 +644,12 @@ func syncSessionBeadsWithSnapshot(
 		isManagedPool := origin == "ephemeral"
 
 		b, exists := bySessionName[sn]
+		state := syncSessionCachedState(sn, b, exists, sp)
 		if !exists && isConfiguredNamed {
 			if reopened, ok := reopenClosedConfiguredNamedSessionBead(cityPath, store, cfg, cityName, tp.ConfiguredNamedIdentity, sn, state, now, nil, stderr); ok {
 				b = reopened
 				exists = true
+				state = syncSessionCachedState(sn, b, exists, sp)
 				bySessionName[sn] = reopened
 				openBeads = append(openBeads, reopened)
 				indexBySessionName[sn] = len(openBeads) - 1
