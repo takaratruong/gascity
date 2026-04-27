@@ -598,6 +598,37 @@ func TestCachingStoreCloseAllMarksRefreshFailuresDirty(t *testing.T) {
 	}
 }
 
+func TestCachingStoreCachedListReturnsSnapshotWithDirtyEntries(t *testing.T) {
+	t.Parallel()
+
+	backing := &refreshFailingStore{Store: NewMemStore()}
+	bead, err := backing.Create(Bead{Title: "active work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	title := "updated while refresh fails"
+	backing.failNextGet = true
+	if err := cache.Update(bead.ID, UpdateOpts{Title: &title}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	rows, ok := cache.CachedList(ListQuery{Status: "open"})
+	if !ok {
+		t.Fatal("CachedList returned ok=false for dirty cache, want snapshot")
+	}
+	if len(rows) != 1 || rows[0].ID != bead.ID {
+		t.Fatalf("CachedList = %#v, want dirty snapshot row %s", rows, bead.ID)
+	}
+	if rows[0].Title == title {
+		t.Fatalf("CachedList returned refreshed title %q; test setup did not create a dirty stale snapshot", rows[0].Title)
+	}
+}
+
 type refreshFailingStore struct {
 	Store
 	failNextGet bool

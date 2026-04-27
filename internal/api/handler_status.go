@@ -82,7 +82,7 @@ func (s *Server) buildStatusBody() StatusBody {
 	// Count rigs by state.
 	rc := rigCounts{Total: len(cfg.Rigs)}
 	for _, rig := range cfg.Rigs {
-		if s.rigSuspended(cfg, rig, store, sp, cityName, s.state.CityPath()) {
+		if s.rigSuspended(cfg, rig, sp, cityName, s.state.CityPath()) {
 			rc.Suspended++
 		}
 	}
