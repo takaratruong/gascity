@@ -125,6 +125,44 @@ func (s sessionSnapshotListFailStore) List(query beads.ListQuery) ([]beads.Bead,
 	return s.Store.List(query)
 }
 
+// TestNewCityRuntimeInitializesSessionDrains is a regression test for
+// gascity-910: previously sessionDrains was only initialized in run() when
+// cityBeadStore() was non-nil. If the bead store failed to open at startup,
+// sessionDrains stayed nil and the bead-driven reconciler was silently
+// skipped — pool agents never spawned even though scaleCheck and
+// poolDesired logged demand. Eager initialization in newCityRuntime makes
+// the reconciler unconditionally reachable; gating happens inside
+// beadReconcileTick on the bead store itself.
+func TestNewCityRuntimeInitializesSessionDrains(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	cr := newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+
+	if cr.sessionDrains == nil {
+		t.Fatal("sessionDrains nil after newCityRuntime; bead reconciler would be silently disabled (gascity-910)")
+	}
+}
+
 func TestCityRuntimeRequestDeferredDrainFollowUpTick_PokesOnce(t *testing.T) {
 	cr := &CityRuntime{
 		sessionDrains: newDrainTracker(),
@@ -1574,6 +1612,7 @@ func TestCityRuntimeTick_LogsWispGCPurgeCountWithNonFatalError(t *testing.T) {
 		cfg:                 &config.City{},
 		sp:                  runtime.NewFake(),
 		standaloneCityStore: store,
+		sessionDrains:       newDrainTracker(),
 		wg:                  fixedWispGC{purged: 2, err: fmt.Errorf("delete failed")},
 		rec:                 events.Discard,
 		logPrefix:           "test-city",
@@ -1606,6 +1645,7 @@ func TestCityRuntimeTick_PrefixesEachJoinedWispGCErrorLine(t *testing.T) {
 		cfg:                 &config.City{},
 		sp:                  runtime.NewFake(),
 		standaloneCityStore: store,
+		sessionDrains:       newDrainTracker(),
 		wg: fixedWispGC{err: fmt.Errorf("%s\n%s",
 			"deleting expired bead \"mol-1\": delete failed",
 			"listing closed order-tracking beads: list failed",
