@@ -109,6 +109,21 @@ type partialAssignedWorkStore struct {
 	partialReady      bool
 }
 
+type controllerDemandPartialStore struct {
+	*beads.MemStore
+}
+
+func (s *controllerDemandPartialStore) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
+	rows, err := s.MemStore.Ready(query...)
+	if err != nil {
+		return nil, err
+	}
+	if len(query) == 0 {
+		return rows, &beads.PartialResultError{Op: "bd ready", Err: errors.New("skipped corrupt controller demand bead")}
+	}
+	return rows, nil
+}
+
 type acpOnlyDesiredStateProvider struct {
 	*runtime.Fake
 }
@@ -306,7 +321,7 @@ func TestDefaultScaleCheckCountsUsesCachedReadyReadModel(t *testing.T) {
 		t.Fatalf("PrimeActive: %v", err)
 	}
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
 		template: "gascity/workflows.codex-min",
 		storeKey: "rig:gascity",
 		store:    cache,
@@ -339,7 +354,7 @@ func TestDefaultScaleCheckCountsIgnoresOpenMoleculeContainers(t *testing.T) {
 		t.Fatalf("PrimeActive: %v", err)
 	}
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
 		template: "gascity/workflows.codex-min",
 		storeKey: "rig:gascity",
 		store:    cache,
@@ -384,7 +399,7 @@ func TestDefaultScaleCheckCountsHonorsCachedWriteThroughDependencies(t *testing.
 		t.Fatalf("DepAdd: %v", err)
 	}
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
 		template: "gascity/workflows.codex-max",
 		storeKey: "rig:gascity",
 		store:    cache,
@@ -419,7 +434,7 @@ func TestDefaultScaleCheckCountsFallsBackWhenCachedEventDepsUnknown(t *testing.T
 	}
 	cache.ApplyEvent("bead.created", []byte(`{"id":"gc-blocked","status":"open","metadata":{"gc.routed_to":"gascity/workflows.codex-max"}}`))
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
 		template: "gascity/workflows.codex-max",
 		storeKey: "rig:gascity",
 		store:    cache,
@@ -448,7 +463,7 @@ func TestDefaultScaleCheckCountsUsesPartialReadyRows(t *testing.T) {
 		t.Fatalf("create routed bead: %v", err)
 	}
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+	counts, partialTemplates, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
 		template: "gascity/workflows.codex-max",
 		storeKey: "rig:gascity",
 		store:    store,
@@ -459,12 +474,15 @@ func TestDefaultScaleCheckCountsUsesPartialReadyRows(t *testing.T) {
 	if len(errs) != 1 || !beads.IsPartialResult(errs[0]) {
 		t.Fatalf("defaultScaleCheckCounts errs = %v, want partial-result diagnostic", errs)
 	}
+	if !partialTemplates["gascity/workflows.codex-max"] {
+		t.Fatalf("partialTemplates = %v, want affected template marked partial", partialTemplates)
+	}
 }
 
 func TestDefaultScaleCheckCountsReadyErrorNamesAffectedTemplates(t *testing.T) {
 	store := &readyFailStore{Store: beads.NewMemStore()}
 
-	_, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{
+	_, partialTemplates, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{
 		{template: "gascity/workflows.codex-min", storeKey: "rig:gascity", store: store},
 		{template: "gascity/workflows.codex-max", storeKey: "rig:gascity", store: store},
 	})
@@ -475,6 +493,11 @@ func TestDefaultScaleCheckCountsReadyErrorNamesAffectedTemplates(t *testing.T) {
 	for _, want := range []string{"rig:gascity", "gascity/workflows.codex-min", "gascity/workflows.codex-max"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("defaultScaleCheckCounts err = %q, want affected template %q", msg, want)
+		}
+	}
+	for _, want := range []string{"gascity/workflows.codex-min", "gascity/workflows.codex-max"} {
+		if !partialTemplates[want] {
+			t.Fatalf("partialTemplates = %v, want %q marked partial", partialTemplates, want)
 		}
 	}
 }
@@ -503,7 +526,7 @@ func TestDefaultNamedSessionDemandUsesPartialReadyRows(t *testing.T) {
 		}},
 	}
 
-	demand, errs := defaultNamedSessionDemand([]defaultScaleCheckTarget{{
+	demand, partialTemplates, errs := defaultNamedSessionDemand([]defaultScaleCheckTarget{{
 		template: "worker",
 		storeKey: "rig:gascity",
 		store:    store,
@@ -519,6 +542,9 @@ func TestDefaultNamedSessionDemandUsesPartialReadyRows(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("defaultNamedSessionDemand err = %q, want affected template %q", msg, want)
 		}
+	}
+	if !partialTemplates["worker"] {
+		t.Fatalf("partialTemplates = %v, want worker marked partial", partialTemplates)
 	}
 }
 
@@ -544,7 +570,7 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	}
 	target := defaultScaleCheckTargetForAgent(cityPath, cfg, agent, cityStore, nil)
 
-	counts, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{target})
+	counts, partialTemplates, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{target})
 	if got := counts["repos/repo/worker"]; got != 0 {
 		t.Fatalf("defaultScaleCheckCounts = %d, want 0", got)
 	}
@@ -553,6 +579,9 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	}
 	if !strings.Contains(errs[0].Error(), `rig store "repo" unavailable`) {
 		t.Fatalf("defaultScaleCheckCounts err = %v, want missing rig-store diagnostic", errs[0])
+	}
+	if !partialTemplates["repos/repo/worker"] {
+		t.Fatalf("partialTemplates = %v, want missing rig-store template marked partial", partialTemplates)
 	}
 }
 
@@ -588,6 +617,12 @@ func TestBuildDesiredStateDefaultScaleCheckMissingRigStoreReportsZeroDemand(t *t
 	got := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
 	if demand := got.ScaleCheckCounts["repos/repo/worker"]; demand != 0 {
 		t.Fatalf("ScaleCheckCounts[repos/repo/worker] = %d, want 0 without rig store", demand)
+	}
+	if got.StoreQueryPartial {
+		t.Fatalf("StoreQueryPartial = true, want false for scoped default scale_check failure")
+	}
+	if !got.ScaleCheckPartialTemplates["repos/repo/worker"] {
+		t.Fatalf("ScaleCheckPartialTemplates = %v, want missing rig-store template marked partial", got.ScaleCheckPartialTemplates)
 	}
 	if len(got.State) != 0 {
 		t.Fatalf("desired sessions = %d, want none without rig store demand", len(got.State))
@@ -2792,6 +2827,246 @@ func TestBuildDesiredState_ManualImplicitPoolSessionsStayDesired(t *testing.T) {
 	}
 }
 
+func TestBuildDesiredState_ScaleCheckErrorRetainsOnlyAffectedPoolSessions(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	workerSession := beads.Bead{
+		ID:     "session-worker",
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-123",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "awake",
+		},
+	}
+	helperSession := beads.Bead{
+		ID:     "session-helper",
+		Title:  "helper",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:helper"},
+		Metadata: map[string]string{
+			"session_name":         "helper-bd-123",
+			"template":             "helper",
+			"agent_name":           "helper",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "awake",
+		},
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{
+				Name:              "worker",
+				StartCommand:      "echo",
+				ScaleCheck:        "exit 42",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+			},
+			{
+				Name:              "helper",
+				StartCommand:      "echo",
+				ScaleCheck:        "printf 0",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+			},
+		},
+	}
+
+	var stderr strings.Builder
+	result := buildDesiredStateWithSessionBeads(
+		"test-city",
+		cityPath,
+		time.Now().UTC(),
+		cfg,
+		runtime.NewFake(),
+		store,
+		nil,
+		newSessionBeadSnapshot([]beads.Bead{workerSession, helperSession}),
+		nil,
+		&stderr,
+	)
+
+	if result.StoreQueryPartial {
+		t.Fatalf("StoreQueryPartial = true, want false for scoped scale_check failure; stderr=%s", stderr.String())
+	}
+	if !result.ScaleCheckPartialTemplates["worker"] {
+		t.Fatalf("ScaleCheckPartialTemplates[worker] = false, want true; templates=%v stderr=%s", result.ScaleCheckPartialTemplates, stderr.String())
+	}
+	if !result.PoolScaleCheckPartialTemplates["worker"] {
+		t.Fatalf("PoolScaleCheckPartialTemplates[worker] = false, want true; templates=%v", result.PoolScaleCheckPartialTemplates)
+	}
+	if result.ScaleCheckPartialTemplates["helper"] {
+		t.Fatalf("ScaleCheckPartialTemplates[helper] = true, want false; templates=%v", result.ScaleCheckPartialTemplates)
+	}
+	if _, ok := result.State["worker-bd-123"]; !ok {
+		t.Fatalf("affected worker session not retained in desired state: keys=%v stderr=%s", mapKeys(result.State), stderr.String())
+	}
+	if _, ok := result.State["helper-bd-123"]; ok {
+		t.Fatalf("unaffected helper session retained despite clean zero demand: keys=%v", mapKeys(result.State))
+	}
+	if got := result.ScaleCheckCounts["worker"]; got != 0 {
+		t.Fatalf("ScaleCheckCounts[worker] = %d, want 0 on failed new-demand probe", got)
+	}
+}
+
+func TestBuildDesiredState_ScaleCheckErrorPreservesDormantAffectedPoolSessionWithoutWakeDemand(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	workerSession := beads.Bead{
+		ID:     "session-worker",
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-123",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "asleep",
+		},
+	}
+	helperSession := beads.Bead{
+		ID:     "session-helper",
+		Title:  "helper",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:helper"},
+		Metadata: map[string]string{
+			"session_name":         "helper-bd-123",
+			"template":             "helper",
+			"agent_name":           "helper",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "asleep",
+		},
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{
+				Name:              "worker",
+				StartCommand:      "echo",
+				ScaleCheck:        "exit 42",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+			},
+			{
+				Name:              "helper",
+				StartCommand:      "echo",
+				ScaleCheck:        "printf 0",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+			},
+		},
+	}
+	snapshot := newSessionBeadSnapshot([]beads.Bead{workerSession, helperSession})
+
+	var stderr strings.Builder
+	result := buildDesiredStateWithSessionBeads(
+		"test-city",
+		cityPath,
+		time.Now().UTC(),
+		cfg,
+		runtime.NewFake(),
+		store,
+		nil,
+		snapshot,
+		nil,
+		&stderr,
+	)
+
+	if result.StoreQueryPartial {
+		t.Fatalf("StoreQueryPartial = true, want false for scoped scale_check failure; stderr=%s", stderr.String())
+	}
+	if _, ok := result.State["worker-bd-123"]; !ok {
+		t.Fatalf("dormant affected worker session not preserved in desired state: keys=%v stderr=%s", mapKeys(result.State), stderr.String())
+	}
+	if _, ok := result.State["helper-bd-123"]; ok {
+		t.Fatalf("unaffected dormant helper session retained despite clean zero demand: keys=%v", mapKeys(result.State))
+	}
+
+	poolDesired := retainScaleCheckPartialPoolDesired(
+		PoolDesiredCounts(ComputePoolDesiredStates(cfg, nil, snapshot.Open(), result.ScaleCheckCounts)),
+		snapshot,
+		result.PoolScaleCheckPartialTemplates,
+	)
+	if got := poolDesired["worker"]; got != 0 {
+		t.Fatalf("poolDesired[worker] = %d, want dormant preservation without wake demand", got)
+	}
+}
+
+func TestBuildDesiredState_NamedScaleCheckPartialDoesNotRetainGenericPoolSession(t *testing.T) {
+	cityPath := t.TempDir()
+	store := &controllerDemandPartialStore{MemStore: beads.NewMemStore()}
+	poolSession := beads.Bead{
+		ID:     "session-worker-pool",
+		Title:  "worker pool",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel, "template:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-123",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "awake",
+		},
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			StartCommand:      "echo",
+			MinActiveSessions: intPtr(0),
+			MaxActiveSessions: intPtr(3),
+		}},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "worker",
+			Mode:     "on_demand",
+		}},
+	}
+
+	var stderr strings.Builder
+	result := buildDesiredStateWithSessionBeads(
+		"test-city",
+		cityPath,
+		time.Now().UTC(),
+		cfg,
+		runtime.NewFake(),
+		store,
+		nil,
+		newSessionBeadSnapshot([]beads.Bead{poolSession}),
+		nil,
+		&stderr,
+	)
+
+	if result.StoreQueryPartial {
+		t.Fatalf("StoreQueryPartial = true, want false for scoped named scale_check failure; stderr=%s", stderr.String())
+	}
+	if !result.ScaleCheckPartialTemplates["worker"] {
+		t.Fatalf("ScaleCheckPartialTemplates[worker] = false, want named-session partial recorded; templates=%v stderr=%s", result.ScaleCheckPartialTemplates, stderr.String())
+	}
+	if result.PoolScaleCheckPartialTemplates["worker"] {
+		t.Fatalf("PoolScaleCheckPartialTemplates[worker] = true, want false for named-session partial; templates=%v", result.PoolScaleCheckPartialTemplates)
+	}
+	if !result.NamedScaleCheckPartialTemplates["worker"] {
+		t.Fatalf("NamedScaleCheckPartialTemplates[worker] = false, want true; templates=%v", result.NamedScaleCheckPartialTemplates)
+	}
+	if _, ok := result.State["worker-bd-123"]; ok {
+		t.Fatalf("generic pool session retained by named-session partial: keys=%v stderr=%s", mapKeys(result.State), stderr.String())
+	}
+}
+
 func TestBuildDesiredState_DrainedPoolManagedSessionIsNotRediscovered(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
@@ -3177,6 +3452,58 @@ func TestBuildDesiredState_StoreBackedPoolUsesQualifiedInstanceNameForBindings(t
 	}
 }
 
+func TestBuildDesiredState_RecoversPoolTemplateFromAliasOnlyBindingIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "ops furiosa",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "ops-furiosa-session",
+			"alias":        "frontend/ops.furiosa",
+			"pool_slot":    "1",
+			"pool_managed": "true",
+			"state":        "active",
+		},
+	}); err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{{
+			Name:          "worker",
+			Dir:           "frontend",
+			BindingName:   "ops",
+			NamepoolNames: []string{"furiosa", "nux"},
+			WorkDir:       ".gc/worktrees/{{.AgentBase}}",
+			ScaleCheck:    "printf 1",
+		}},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	got, ok := dsResult.State["ops-furiosa-session"]
+	if !ok {
+		t.Fatalf("desired state missing alias-only pool session: keys=%v", mapKeys(dsResult.State))
+	}
+	if got.TemplateName != "frontend/ops.worker" {
+		t.Fatalf("TemplateName = %q, want %q", got.TemplateName, "frontend/ops.worker")
+	}
+	wantInstance := cfg.Agents[0].QualifiedInstanceName("furiosa")
+	if got.InstanceName != wantInstance {
+		t.Fatalf("InstanceName = %q, want %q", got.InstanceName, wantInstance)
+	}
+	if got.Alias != wantInstance {
+		t.Fatalf("Alias = %q, want %q", got.Alias, wantInstance)
+	}
+	if got.Env["GC_AGENT"] != wantInstance {
+		t.Fatalf("GC_AGENT = %q, want %q", got.Env["GC_AGENT"], wantInstance)
+	}
+	wantWorkDir := filepath.Join(cityPath, ".gc", "worktrees", "ops.furiosa")
+	if got.WorkDir != wantWorkDir {
+		t.Fatalf("WorkDir = %q, want %q", got.WorkDir, wantWorkDir)
+	}
+}
+
 func TestBuildDesiredState_PendingCreatePoolSessionUsesConcreteBeadIdentity(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
@@ -3433,6 +3760,307 @@ func TestBuildDesiredState_LegacyAliaslessEphemeralPoolSessionFallsBackToSession
 	wantWorkDir := filepath.Join(cityPath, ".gc", "worktrees", "demo", "ants", "s-gc-legacy")
 	if got.WorkDir != wantWorkDir {
 		t.Fatalf("WorkDir = %q, want %q", got.WorkDir, wantWorkDir)
+	}
+}
+
+func TestBuildDesiredState_RediscoveriesUniqueLegacyLocalPoolTemplate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-5",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(1)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	got, ok := dsResult.State["worker-5"]
+	if !ok {
+		t.Fatalf("desired state missing legacy local session: keys=%v", mapKeys(dsResult.State))
+	}
+	if got.TemplateName != "frontend/worker" {
+		t.Fatalf("TemplateName = %q, want %q", got.TemplateName, "frontend/worker")
+	}
+}
+
+func TestBuildDesiredState_DoesNotRediscoverAmbiguousLegacyLocalPoolTemplate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-5",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["worker-5"]; ok {
+		t.Fatalf("desired state %#v unexpectedly rediscovered ambiguous local pool template", dsResult.State["worker-5"])
+	}
+}
+
+func TestBuildDesiredState_RecoversPoolTemplateFromAgentNameOnlyLegacyLocalIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "worker-5",
+			"session_name": "worker-5",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(1)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	got, ok := dsResult.State["worker-5"]
+	if !ok {
+		t.Fatalf("desired state missing agent_name-only legacy session: keys=%v", mapKeys(dsResult.State))
+	}
+	if got.TemplateName != "frontend/worker" {
+		t.Fatalf("TemplateName = %q, want %q", got.TemplateName, "frontend/worker")
+	}
+}
+
+func TestBuildDesiredState_DoesNotRecoverPoolTemplateFromAmbiguousLegacyLocalAlias(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"alias":        "worker-5",
+			"session_name": "worker-5",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["worker-5"]; ok {
+		t.Fatalf("desired state %#v unexpectedly recovered ambiguous local alias identity", dsResult.State["worker-5"])
+	}
+}
+
+func TestBuildDesiredState_RediscoveriesLegacyCommonNamePoolTemplate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"common_name":  "worker",
+			"session_name": "worker-5",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(1)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	got, ok := dsResult.State["worker-5"]
+	if !ok {
+		t.Fatalf("desired state missing legacy common_name session: keys=%v", mapKeys(dsResult.State))
+	}
+	if got.TemplateName != "frontend/worker" {
+		t.Fatalf("TemplateName = %q, want %q", got.TemplateName, "frontend/worker")
+	}
+}
+
+func TestBuildDesiredState_DoesNotRediscoverFreshCreatingOutOfBoundsQualifiedPoolIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "frontend/worker-7",
+			"session_name": "custom-worker-7",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["custom-worker-7"]; ok {
+		t.Fatalf("desired state %#v unexpectedly kept fresh out-of-bounds qualified pool identity", dsResult.State["custom-worker-7"])
+	}
+}
+
+func TestBuildDesiredState_DoesNotRediscoverZeroCapacityQualifiedPoolIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "frontend/worker-1",
+			"session_name": "custom-worker-1",
+			"state":        "creating",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(0)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["custom-worker-1"]; ok {
+		t.Fatalf("desired state %#v unexpectedly kept zero-capacity qualified pool identity", dsResult.State["custom-worker-1"])
+	}
+}
+
+func TestBuildDesiredState_DoesNotRediscoverStaleCreatingLegacyPoolTemplate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"common_name":               "worker",
+			"session_name":              "worker-7",
+			"state":                     "creating",
+			"pending_create_started_at": time.Now().Add(-staleCreatingStateTimeout - time.Minute).UTC().Format(time.RFC3339),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(1)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["worker-7"]; ok {
+		t.Fatalf("desired state %#v unexpectedly kept stale creating legacy pool bead", dsResult.State["worker-7"])
+	}
+}
+
+func TestBuildDesiredState_DoesNotPreserveOutOfBoundsBoundedPoolSlotWithoutIdentity(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	bead := beads.Bead{
+		Metadata: map[string]string{
+			"template":  "frontend/worker",
+			"pool_slot": "99",
+		},
+	}
+
+	if slot := existingPoolSlotWithConfig(cfg, cfgAgent, bead); slot != 0 {
+		t.Fatalf("existingPoolSlotWithConfig(out-of-bounds bounded slot) = %d, want 0", slot)
+	}
+}
+
+func TestBuildDesiredState_DoesNotRecoverOutOfBoundsAliasOnlyBoundedPoolSlot(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/worker",
+			"alias":        "frontend/worker-7",
+			"session_name": "custom-worker-7",
+			"state":        "active",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", Provider: "test-agent", StartCommand: "true", WorkDir: ".", MaxActiveSessions: intPtr(5)},
+		},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	if _, ok := dsResult.State["custom-worker-7"]; ok {
+		t.Fatalf("desired state %#v unexpectedly preserved out-of-bounds alias-only pool identity", dsResult.State["custom-worker-7"])
+	}
+}
+
+func TestClaimPoolSlot_PreservesStampedOutOfBoundsLiveIdentity(t *testing.T) {
+	cfgAgent := &config.Agent{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)}
+	bead := beads.Bead{
+		Metadata: map[string]string{
+			"pool_slot":  "7",
+			"agent_name": "frontend/worker-7",
+			"alias":      "frontend/worker-7",
+		},
+	}
+
+	if slot := existingPoolSlot(cfgAgent, bead); slot != 7 {
+		t.Fatalf("existingPoolSlot(stamped live slot) = %d, want 7", slot)
+	}
+	used := map[int]bool{}
+	if slot := claimPoolSlot(cfgAgent, bead, used); slot != 7 {
+		t.Fatalf("claimPoolSlot(stamped live slot) = %d, want 7", slot)
 	}
 }
 
@@ -4346,6 +4974,82 @@ func TestEnsureDependencyOnlyTemplate_StoreBackedUsesInstanceIdentity(t *testing
 	}
 	if template := tp.Env["GC_TEMPLATE"]; template != "gascity/db" {
 		t.Fatalf("store-backed dep-floor GC_TEMPLATE = %q, want base %q", template, "gascity/db")
+	}
+}
+
+func TestBuildDesiredState_DependencyFloorIgnoresConfigBlindLegacySlotRecovery(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{
+				Name:              "db",
+				Dir:               "gascity",
+				StartCommand:      "true",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+				ScaleCheck:        "printf 0",
+			},
+			{
+				Name:              "api",
+				Dir:               "gascity",
+				StartCommand:      "true",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(3),
+				ScaleCheck:        "printf 0",
+				DependsOn:         []string{"gascity/db"},
+			},
+		},
+	}
+
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "api",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "template:gascity/api"},
+		Metadata: map[string]string{
+			"template":     "gascity/api",
+			"agent_name":   "gascity/api",
+			"session_name": "s-api-root",
+			"state":        "active",
+			"pool_managed": "true",
+			"pool_slot":    "1",
+		},
+	}); err != nil {
+		t.Fatalf("seed api root bead: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "db",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":      "db-2",
+			"session_name":    "s-db-dep-legacy",
+			"state":           "active",
+			"dependency_only": "true",
+			"pool_managed":    "true",
+		},
+	}); err != nil {
+		t.Fatalf("seed dependency-only db bead: %v", err)
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+
+	var tp TemplateParams
+	var found bool
+	for _, entry := range dsResult.State {
+		if entry.TemplateName == "gascity/db" && entry.DependencyOnly {
+			tp = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("store-backed dependency floor for db not found: %+v", dsResult.State)
+	}
+
+	if got, want := tp.Env["GC_ALIAS"], "gascity/db-1"; got != want {
+		t.Fatalf("store-backed dep-floor GC_ALIAS = %q, want %q when legacy bead lacks matching template metadata", got, want)
 	}
 }
 
