@@ -520,6 +520,7 @@ Rig defines an external project registered in the city.
 | `name` | string | **yes** |  | Name is the unique identifier for this rig. |
 | `path` | string |  |  | Path is the absolute filesystem path to the rig's repository. |
 | `prefix` | string |  |  | Prefix overrides the auto-derived bead ID prefix for this rig. |
+| `default_branch` | string |  |  | DefaultBranch is the rig repository's mainline branch (e.g. "main", "master", "develop"). When set, polecats and the refinery use this as the default merge target instead of probing origin/HEAD at sling time. Captured by `gc rig add` from the rig's git config; set manually for rigs whose mainline isn't reachable via origin/HEAD. |
 | `suspended` | boolean |  |  | Suspended prevents the reconciler from spawning agents in this rig. Toggle with gc rig suspend/resume. |
 | `formulas_dir` | string |  |  | FormulasDir is a rig-local formula directory (Layer 4). Overrides pack formulas for this rig by filename. Relative paths resolve against the city directory. |
 | `includes` | []string |  |  | Includes lists pack directories or URLs for this rig (V1 mechanism). Each entry is a local path, a git source//sub#ref URL, or a GitHub tree URL. |
@@ -541,6 +542,7 @@ RigPatch modifies an existing rig identified by Name.
 | `name` | string | **yes** |  | Name is the targeting key (required). Must match an existing rig's name. |
 | `path` | string |  |  | Path overrides the rig's filesystem path. |
 | `prefix` | string |  |  | Prefix overrides the bead ID prefix. |
+| `default_branch` | string |  |  | DefaultBranch overrides the rig's recorded mainline branch. |
 | `suspended` | boolean |  |  | Suspended overrides the rig's suspended state. |
 
 ## Service
@@ -637,7 +639,7 @@ Workspace holds city-level metadata and optional defaults that apply to all agen
 | `suspended` | boolean |  |  | Suspended controls whether the city is suspended. When true, all agents are effectively suspended: the reconciler won't spawn them, and gc hook/prime return empty. Inherits downward — individual agent/rig suspended fields are checked independently. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions is the workspace-level cap on total concurrent sessions. Nil means unlimited. Agents and rigs inherit this if they don't set their own. |
 | `session_template` | string |  |  | SessionTemplate is a template string supporting placeholders: &#123;&#123;.City&#125;&#125;, &#123;&#123;.Agent&#125;&#125; (sanitized), &#123;&#123;.Dir&#125;&#125;, &#123;&#123;.Name&#125;&#125;. Controls tmux session naming. Default (empty): "&#123;&#123;.Agent&#125;&#125;" — just the sanitized agent name. Per-city tmux socket isolation makes a city prefix unnecessary. |
-| `install_agent_hooks` | []string |  |  | InstallAgentHooks lists provider names whose hooks should be installed into agent working directories. Agent-level overrides workspace-level (replace, not additive). Supported: "claude", "codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp". |
+| `install_agent_hooks` | []string |  |  | InstallAgentHooks lists provider names whose hooks should be installed into agent working directories. Agent-level overrides workspace-level (replace, not additive). Supported: "claude", "codex", "gemini", "opencode", "copilot", "cursor", "kiro", "pi", "omp". |
 | `global_fragments` | []string |  |  | GlobalFragments lists named template fragments injected into every agent's rendered prompt. Applied before per-agent InjectFragments. Each name must match a &#123;&#123; define "name" &#125;&#125; block from a pack's prompts/shared/ directory. |
 | `includes` | []string |  |  | Includes lists pack directories or URLs to compose into this workspace. Replaces the older pack/packs fields. Each entry is a local path, a git source//sub#ref URL, or a GitHub tree URL. |
 | `default_rig_includes` | []string |  |  | DefaultRigIncludes lists pack directories applied to new rigs when "gc rig add" is called without --include. Allows cities to define a default pack for all rigs. |

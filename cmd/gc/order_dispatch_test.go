@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -916,13 +917,46 @@ source = "`+doltDir+`"
 		t.Fatalf("scanAllOrders: %v; stderr: %s", err, stderr.String())
 	}
 
-	const wantDogOrders = 5
-	var gotDogOrders int
+	wantExecDogOrders := map[string]string{
+		"mol-dog-backup":     "$PACK_DIR/assets/scripts/mol-dog-backup.sh",
+		"mol-dog-compactor":  "gc dolt compact",
+		"mol-dog-doctor":     "$PACK_DIR/assets/scripts/mol-dog-doctor.sh",
+		"mol-dog-phantom-db": "$PACK_DIR/assets/scripts/mol-dog-phantom-db.sh",
+	}
+	gotExecDogOrders := map[string]bool{}
+	const wantFormulaDogOrders = 1
+	var gotFormulaDogOrders int
 	for _, a := range aa {
 		if !strings.HasPrefix(a.Name, "mol-dog-") {
 			continue
 		}
-		gotDogOrders++
+		if a.Exec != "" {
+			wantExec, ok := wantExecDogOrders[a.Name]
+			if !ok {
+				t.Fatalf("unexpected exec dog order %q", a.Name)
+			}
+			if a.Pool != "" {
+				t.Fatalf("%s exec order pool = %q, want empty", a.Name, a.Pool)
+			}
+			if a.Exec != wantExec {
+				t.Fatalf("%s exec = %q, want %q", a.Name, a.Exec, wantExec)
+			}
+			const packScriptPrefix = "$PACK_DIR/assets/scripts/"
+			if scriptName := strings.TrimPrefix(wantExec, packScriptPrefix); scriptName != wantExec {
+				scriptPath := filepath.Join(doltDir, "assets", "scripts", scriptName)
+				if _, err := os.Stat(scriptPath); err != nil {
+					t.Fatalf("%s exec script missing: %v", a.Name, err)
+				}
+				if _, err := exec.LookPath("bash"); err == nil {
+					if out, err := exec.Command("bash", "-n", scriptPath).CombinedOutput(); err != nil {
+						t.Fatalf("%s bash -n failed: %v\n%s", a.Name, err, out)
+					}
+				}
+			}
+			gotExecDogOrders[a.Name] = true
+			continue
+		}
+		gotFormulaDogOrders++
 		if a.Pool != "dog" {
 			t.Fatalf("%s pool = %q, want portable bare dog", a.Name, a.Pool)
 		}
@@ -934,8 +968,11 @@ source = "`+doltDir+`"
 			t.Fatalf("qualifyOrderPool(%s) = %q, want ops.dog", a.Name, got)
 		}
 	}
-	if gotDogOrders != wantDogOrders {
-		t.Fatalf("Dolt dog order count = %d, want %d", gotDogOrders, wantDogOrders)
+	if gotFormulaDogOrders != wantFormulaDogOrders {
+		t.Fatalf("Dolt formula-based dog order count = %d, want %d", gotFormulaDogOrders, wantFormulaDogOrders)
+	}
+	if len(gotExecDogOrders) != len(wantExecDogOrders) {
+		t.Fatalf("Dolt exec dog orders = %v, want %v", gotExecDogOrders, wantExecDogOrders)
 	}
 }
 

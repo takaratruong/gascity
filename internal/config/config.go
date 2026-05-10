@@ -456,6 +456,12 @@ type Rig struct {
 	Path string `toml:"path,omitempty"`
 	// Prefix overrides the auto-derived bead ID prefix for this rig.
 	Prefix string `toml:"prefix,omitempty"`
+	// DefaultBranch is the rig repository's mainline branch (e.g. "main",
+	// "master", "develop"). When set, polecats and the refinery use this
+	// as the default merge target instead of probing origin/HEAD at sling
+	// time. Captured by `gc rig add` from the rig's git config; set
+	// manually for rigs whose mainline isn't reachable via origin/HEAD.
+	DefaultBranch string `toml:"default_branch,omitempty"`
 	// Suspended prevents the reconciler from spawning agents in this rig. Toggle with gc rig suspend/resume.
 	Suspended bool `toml:"suspended,omitempty"`
 	// FormulasDir is a rig-local formula directory (Layer 4). Overrides
@@ -752,6 +758,13 @@ func (r *Rig) EffectivePrefix() string {
 	return DeriveBeadsPrefix(r.Name)
 }
 
+// EffectiveDefaultBranch returns the rig's recorded default branch, or the
+// empty string if none is set. Callers should fall back to a runtime probe
+// (e.g., git symbolic-ref) when this returns "".
+func (r *Rig) EffectiveDefaultBranch() string {
+	return strings.TrimSpace(r.DefaultBranch)
+}
+
 // EffectiveHQPrefix returns the bead ID prefix for the city's HQ store.
 // Uses the effective site-bound prefix first, then the declared workspace
 // Prefix, then derives one from the effective city name.
@@ -859,7 +872,7 @@ type Workspace struct {
 	// InstallAgentHooks lists provider names whose hooks should be installed
 	// into agent working directories. Agent-level overrides workspace-level
 	// (replace, not additive). Supported: "claude", "codex", "gemini",
-	// "opencode", "copilot", "cursor", "pi", "omp".
+	// "opencode", "copilot", "cursor", "kiro", "pi", "omp".
 	InstallAgentHooks []string `toml:"install_agent_hooks,omitempty"`
 	// GlobalFragments lists named template fragments injected into every
 	// agent's rendered prompt. Applied before per-agent InjectFragments.

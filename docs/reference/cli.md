@@ -1148,6 +1148,12 @@ For controller-restartable sessions, equivalent to:
   gc mail send $GC_ALIAS &lt;subject&gt; [message]
   gc runtime request-restart
 
+Under normal operation the controller stops controller-restartable
+self-handoff sessions before this command returns. If the controller does not
+act within a bounded timeout, gc handoff exits 1 with a diagnostic instead of
+blocking indefinitely. If interrupted, the restart request remains set for the
+controller to process on its next reconcile tick.
+
 Auto handoff (--auto): sends mail to self and returns without requesting a
 restart. This is for PreCompact hooks, where the provider is already managing
 the context compaction lifecycle.
@@ -1876,6 +1882,10 @@ repeat the flag to compose multiple packs for one rig.
 
 Use --name to set the rig name explicitly (default: directory basename).
 Use --prefix to set the bead ID prefix explicitly (default: derived from name).
+Use --default-branch to set the rig's mainline branch explicitly. By default,
+gc rig add probes the repo's origin/HEAD (and falls back to the currently
+checked-out branch) and stores the result in city.toml so polecats and the
+refinery target the right branch without manual metadata patching.
 Use --start-suspended to add the rig in a suspended state (dormant-by-default).
 The rig's agents won't spawn until explicitly resumed with "gc rig resume".
 
@@ -1893,6 +1903,7 @@ gc rig add <path> [flags]
 gc rig add /path/to/project
   gc rig add /path/to/project --name myrig
   gc rig add /path/to/project --prefix r1
+  gc rig add /path/to/master-repo --default-branch master
   gc rig add ./my-project --include packs/gastown
   gc rig add ./my-project --include packs/planner --include packs/architect
   gc rig add ./my-project --include packs/gastown --start-suspended
@@ -1902,6 +1913,7 @@ gc rig add /path/to/project
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--adopt` | bool |  | adopt existing .beads/ directory (skip init) |
+| `--default-branch` | string |  | mainline branch (default: auto-detect from origin/HEAD or current branch) |
 | `--include` | stringArray |  | pack directory for rig agents (repeatable) |
 | `--name` | string |  | rig name (default: directory basename) |
 | `--prefix` | string |  | bead ID prefix (default: derived from name) |
@@ -1909,10 +1921,11 @@ gc rig add /path/to/project
 
 ## gc rig list
 
-List all registered rigs with their paths, prefixes, and beads status.
+List all registered rigs with their paths, prefixes, default branches, and beads status.
 
 Shows the HQ rig (the city itself) and all configured rigs. Each rig
-displays its bead ID prefix and whether its beads database is initialized.
+displays its bead ID prefix, recorded default branch when set, and whether
+its beads database is initialized.
 
 ```
 gc rig list [flags]
