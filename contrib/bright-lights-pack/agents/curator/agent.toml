@@ -1,0 +1,4 @@
+idle_timeout = "1h"
+nudge = "Run your curator loop: check pause, check capacity, pull kind:proposal beads, dedup, promote. See prompt.template.md."
+scope = "city"
+suspended = true

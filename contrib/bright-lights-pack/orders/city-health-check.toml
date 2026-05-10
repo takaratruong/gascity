@@ -1,0 +1,5 @@
+[order]
+description = "Check and repair core city invariants needed by mayor chat, synthesis, and the dashboard."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/city_health_check.sh"

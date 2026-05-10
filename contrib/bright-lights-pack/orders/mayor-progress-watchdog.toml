@@ -1,0 +1,5 @@
+[order]
+description = "Ask the rig mayor for a concise progress/recovery summary when active convergence work goes stale."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/mayor_progress_watchdog.sh"

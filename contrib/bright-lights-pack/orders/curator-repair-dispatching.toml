@@ -1,0 +1,5 @@
+[order]
+description = "Periodically repair proposal beads left in status:dispatching after failed dispatch."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/curator/repair_dispatching.sh"

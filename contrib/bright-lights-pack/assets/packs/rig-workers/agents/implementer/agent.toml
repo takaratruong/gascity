@@ -1,0 +1,9 @@
+provider = "claude"
+scope = "rig"
+nudge = "Run: CLAIM_AS=\"${GC_ALIAS:-$GC_AGENT}\"; WORK=$(gc hook \"$GC_TEMPLATE\" | jq -r '.[0].id // empty'); [ -n \"$WORK\" ] && gc bd update \"$WORK\" --actor \"$CLAIM_AS\" --claim --set-metadata \"gc.active_session=$GC_SESSION_ID\" --set-metadata \"gc.claimed_by=$CLAIM_AS\". Then implement only that bead."
+work_query = "/home/ubuntu/bright-lights/assets/scripts/convergence/worker_work_query.sh {{.Rig}}/workers.implementer items"
+scale_check = "/home/ubuntu/bright-lights/assets/scripts/convergence/worker_work_query.sh {{.Rig}}/workers.implementer count"
+idle_timeout = "2h"
+min_active_sessions = 0
+max_active_sessions = 7
+suspended = false

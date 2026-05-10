@@ -1,0 +1,5 @@
+idle_timeout = "30m"
+max_active_sessions = 6
+min_active_sessions = 0
+nudge = "Run gc hook; pick up the curator-decide step; promote or skip; close; exit."
+scope = "city"

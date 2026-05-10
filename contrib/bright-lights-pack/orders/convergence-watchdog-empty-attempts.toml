@@ -1,0 +1,5 @@
+[order]
+description = "Nudge active implementation attempts that have no progress or required artifacts after the grace period."
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/watchdog_empty_attempts.sh"

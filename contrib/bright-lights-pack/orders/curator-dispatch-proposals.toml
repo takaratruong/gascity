@@ -1,0 +1,5 @@
+[order]
+description = "On proposal creation, dispatch curator-decide to dedup and promote to the owning rig coordinator."
+trigger = "cooldown"
+interval = "30s"
+exec = "/home/ubuntu/bright-lights/assets/scripts/curator/dispatch_proposals.sh"

@@ -1,0 +1,7 @@
+nudge = "Run gc hook; check mail; claim work routed to robotics-mayor; coordinate robotics-bench research only."
+provider = "claude"
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 1
+sleep_after_idle = "off"
+suspended = false

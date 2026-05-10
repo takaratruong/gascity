@@ -1,0 +1,5 @@
+[order]
+description = "Evaluate whether the Gas City research loop invariants hold for active work."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/maintenance/research_loop_eval.sh mjx-diffphysics"

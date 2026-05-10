@@ -1,0 +1,4 @@
+nudge = "Run gc hook; check mail; claim work routed to park-mayor; coordinate park-manip research only."
+min_active_sessions = 0
+max_active_sessions = 1
+sleep_after_idle = "off"

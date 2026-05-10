@@ -1,0 +1,6 @@
+provider = "claude"
+scope = "city"
+nudge = "Run gc hook; claim one kind:maintenance bead with gc bd update <id> --claim; fix or document the Gas City orchestration issue; run the requested validation; close only that bead."
+idle_timeout = "45m"
+min_active_sessions = 0
+max_active_sessions = 1

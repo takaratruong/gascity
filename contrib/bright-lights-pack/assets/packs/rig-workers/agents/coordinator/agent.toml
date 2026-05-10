@@ -1,0 +1,9 @@
+provider = "claude"
+scope = "rig"
+nudge = "Run: CLAIM_AS=\"${GC_ALIAS:-$GC_AGENT}\"; WORK=$(gc hook \"$GC_TEMPLATE\" | jq -r '.[0].id // empty'); [ -n \"$WORK\" ] && gc bd update \"$WORK\" --actor \"$CLAIM_AS\" --claim --set-metadata \"gc.active_session=$GC_SESSION_ID\" --set-metadata \"gc.claimed_by=$CLAIM_AS\". Then coordinate only that bead: create/nudge implementer and reviewer beads, poll them, and validate artifacts. Do not write experiment files or run training yourself."
+work_query = "/home/ubuntu/bright-lights/assets/scripts/convergence/worker_work_query.sh {{.Rig}}/workers.coordinator items"
+scale_check = "/home/ubuntu/bright-lights/assets/scripts/convergence/worker_work_query.sh {{.Rig}}/workers.coordinator count"
+idle_timeout = "2h"
+min_active_sessions = 0
+max_active_sessions = 8
+suspended = false

@@ -1,0 +1,667 @@
+description = """
+Convergence loop for single-idea research evaluation — coordinator-wisp formula.
+
+Gascity's convergence controller only fires on wisp close, not on per-step
+close. The previous 5-step design expected inter-step scheduling that
+gascity does not provide, causing chronic stalls where step N closed
+but step N+1 was never picked up. This version runs the full pipeline
+inside a single long-lived rig-coordinator step script, but implementation
+retries are Gas City attempt beads, not ad hoc worker loops. Each attempt gets
+its own bead and attempt run directory; the coordinator validates attempts and
+promotes only a passing attempt to the root run directory for review.
+
+Per-iteration script (run by the rig coordinator as one continuous shell block):
+  1. init-run: stamp worktree + stash path metadata on the conv root.
+  2. plan: write plan.md (idempotent — skip if already present).
+  3. dispatch one bounded implement attempt bead at a time; validate artifacts;
+     create the next attempt bead only if validation fails.
+  4. promote the validated attempt artifacts and dispatch review leg; poll for close.
+  5. Synthesize rig-mayor research state, then write followups (curator picks up and promotes):
+       - ACCEPTED        → write followups only when there is a clear next run.
+       - NEEDS_TAKARA    → write followups ONLY if curator is not paused
+                           (try next levers; curator pause = human override).
+       - REJECTED        → no followups (broken code, retry happens via gate).
+  6. Attach the active wisp to the coordinator step, then close the step so
+     Gas City's built-in `gc wisp autoclose` hook closes the wisp and wakes
+     the convergence gate.
+
+Run with:
+  gc converge create \\
+    --formula evaluate-idea \\
+    --target park-manip/workers.coordinator \\
+    --gate condition \\
+    --gate-condition prompts/convergence/gate.sh \\
+    --max-iterations 3 \\
+    --var idea='short title' \\
+    --var idea_description='scope + acceptance + file list' \\
+    --var rig='park-manip'
+"""
+formula = "evaluate-idea"
+version = 4
+convergence = true
+required_vars = ["idea", "idea_description", "rig"]
+
+[vars]
+[vars.idea]
+description = "Short title of the research idea"
+required = true
+
+[vars.idea_description]
+description = "Full spec: scope, acceptance criterion, files in/out of scope, constraints"
+required = true
+
+[vars.rig]
+description = "Rig the idea lives in (e.g. 'park-manip'). Determines bead prefix, run dir, agent pool."
+required = true
+
+[[steps]]
+id = "run-iteration"
+title = "Run a full iteration of evaluate-idea (plan → impl → review → followups)"
+description = """
+You are the rig-local coordinator, executing this evaluation iteration. This step runs the
+full iteration inline — do NOT return control to the controller between
+legs. Gascity's controller does not re-schedule mid-wisp; if you exit
+early, the wisp remains open with nothing done and the convergence stalls.
+
+Think of this step as one long coordination script with polling loops. Work
+top-to-bottom; only exit when review.md has a VERDICT line and synthesis has
+been updated. Followups are optional and should be filed only when they are
+concrete, higher-value next runs.
+
+**Coordinator role boundary, non-negotiable:**
+- You dispatch implementer and reviewer beads. You do not implement.
+- Do not write source files, training scripts, metrics, plots, videos, or any
+  files under an attempt directory except coordinator validation notes such as
+  `validation_failed.txt` / `validation_passed.txt`.
+- Do not run Python training/evaluation commands yourself. Do not call
+  `run_attempt_once.sh` yourself. That command is only for the implementer bead.
+- If an implementer bead is open or in progress, poll/nudge/repair that bead.
+  Never "help" by doing the implementer's work inside the coordinator session.
+- If the implementer pool fails to wake, use Gas City routing/session repair
+  (`gc sling ... --nudge --no-convoy --force`,
+  `/home/ubuntu/bright-lights/assets/scripts/convergence/nudge_stale_routed.sh`,
+  or `gc session wake`). Do not bypass the implementer role.
+
+## 1. Worktree + run dir setup
+
+```bash
+CLAIMED_BEAD="${GC_BEAD_ID:-}"
+if [ -z "$CLAIMED_BEAD" ]; then
+  CLAIMED_BEAD=$(gc bd list --status in_progress \
+    --metadata-field "gc.routed_to={{rig}}/workers.coordinator" \
+    --limit 0 --json 2>/dev/null \
+    | jq -r --arg s "${GC_SESSION_NAME:-}" --arg a "${GC_ALIAS:-${GC_AGENT:-}}" '
+      [
+        .[]
+        | select((.assignee // "") == $s or (.assignee // "") == $a)
+        | .id
+      ][0] // empty')
+fi
+if [ -z "$CLAIMED_BEAD" ]; then
+  CLAIMED_BEAD="$(gc hook "{{rig}}/workers.coordinator" 2>/dev/null | jq -r '.[0].id // empty')"
+fi
+[ -n "$CLAIMED_BEAD" ] || { echo "FAIL: no claimed coordinator bead found"; exit 1; }
+WISP_ROOT="$CLAIMED_BEAD"
+STEP_BEAD="$CLAIMED_BEAD"
+CLAIMED_JSON=$(gc bd show "$CLAIMED_BEAD" --json 2>/dev/null | jq 'if type=="array" then .[0] else . end' 2>/dev/null || true)
+CLAIMED_PARENT=$(printf '%s\n' "$CLAIMED_JSON" | jq -r '.parent_id // .parent // empty' 2>/dev/null || true)
+CLAIMED_STEP_REF=$(printf '%s\n' "$CLAIMED_JSON" | jq -r '.metadata["gc.step_ref"] // empty' 2>/dev/null || true)
+if [ -n "$CLAIMED_PARENT" ] && [ -n "$CLAIMED_STEP_REF" ]; then
+  WISP_ROOT="$CLAIMED_PARENT"
+fi
+ROOT_DIR_ID="$WISP_ROOT"
+CURSOR="$WISP_ROOT"
+for _ in $(seq 1 8); do
+  CURSOR_JSON=$(gc bd show "$CURSOR" --json 2>/dev/null || true)
+  [ -z "$CURSOR_JSON" ] && break
+  if printf '%s\n' "$CURSOR_JSON" | jq -e '(if type=="array" then .[0] else . end).metadata."convergence.formula" // empty' >/dev/null; then
+    ROOT_DIR_ID="$CURSOR"
+    break
+  fi
+  PARENT=$(printf '%s\n' "$CURSOR_JSON" | jq -r '(if type=="array" then .[0] else . end).parent // empty')
+  [ -z "$PARENT" ] && break
+  CURSOR="$PARENT"
+done
+RIG_SRC="/home/ubuntu/projects/{{rig}}"
+WORKTREE_DIR="/home/ubuntu/worktrees/{{rig}}/$ROOT_DIR_ID"
+BRANCH_NAME="conv/$ROOT_DIR_ID"
+ITERATION="${GC_ITERATION:-${WISP_ROOT##*.}}"
+case "$ITERATION" in
+  ''|*[!0-9]*) ITERATION=1 ;;
+esac
+
+# Rig-scoped worker pack import. This keeps the formula generic: each rig
+# imports the same `workers` pack, yielding targets like
+# `park-manip/workers.implementer` and `mjx-diffphysics/workers.reviewer`.
+IMPLEMENTER_TARGET="{{rig}}/workers.implementer"
+REVIEWER_TARGET="{{rig}}/workers.reviewer"
+
+# Parent branch: retry or followup inherits parent's accepted code, else main.
+PARENT_RUN=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.parent_run" // empty')
+PARENT_BRANCH="main"
+if [ -n "$PARENT_RUN" ]; then
+  if (cd "$RIG_SRC" && git show-ref --verify --quiet "refs/heads/conv/$PARENT_RUN"); then
+    PARENT_BRANCH="conv/$PARENT_RUN"
+  fi
+fi
+
+# Idempotent: reuse worktree on re-entry
+if [ ! -d "$WORKTREE_DIR" ]; then
+  (cd "$RIG_SRC" && git fetch --all --quiet 2>/dev/null || true)
+  if (cd "$RIG_SRC" && git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"); then
+    git -C "$RIG_SRC" worktree add "$WORKTREE_DIR" "$BRANCH_NAME" || {
+      echo "FAIL: could not attach worktree to existing branch"; exit 1;
+    }
+  else
+    git -C "$RIG_SRC" worktree add -b "$BRANCH_NAME" "$WORKTREE_DIR" "$PARENT_BRANCH" || {
+      echo "FAIL: could not create worktree from $PARENT_BRANCH"; exit 1;
+    }
+  fi
+fi
+
+# Stash worktree/branch on conv root so specialists find it.
+WT_META=$(jq -n --arg w "$WORKTREE_DIR" --arg b "$BRANCH_NAME" --arg p "$PARENT_BRANCH" \\
+  '{"gc.worktree_dir": $w, "gc.worktree_branch": $b, "gc.worktree_parent_branch": $p}')
+gc bd update "$ROOT_DIR_ID" --metadata "$WT_META"
+
+# Seed lineage metadata on iteration 1 only.
+if [ "$ITERATION" = "1" ]; then
+  EXISTING_ROOT=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.lineage_root" // empty')
+  if [ -z "$EXISTING_ROOT" ]; then
+    LMETA=$(jq -n --arg r "$ROOT_DIR_ID" --arg title "{{idea}}" \
+      '{"gc.lineage_root": $r, "gc.lineage_depth": "0", "gc.thread_id": $r, "gc.thread_title": $title, "gc.thread_role": "root"}')
+    gc bd update "$ROOT_DIR_ID" --metadata "$LMETA"
+  fi
+fi
+
+RUN_DIR="$WORKTREE_DIR/results/run-$ROOT_DIR_ID"
+mkdir -p "$RUN_DIR"
+EVALUATE_OPS="/home/ubuntu/bright-lights/assets/scripts/convergence/evaluate_iteration_ops.sh"
+```
+
+## 2. Write plan.md (idempotent — skip on re-entry / iteration > 1)
+
+If $RUN_DIR/plan.md already exists, leave it alone. The implementer adapts
+based on review.md from the prior iteration.
+
+Required plan.md sections (WITH charter context):
+- Reference: `{{rig}}/PROJECT.md` (charter; goals + non-negotiables)
+- Recent operator directives:
+  `gc bd list --label kind:directive --label rig:{{rig}} --status open --sort updated --reverse --limit 20 --json`
+- Active operator policies:
+  `gc bd list --label kind:policy --label rig:{{rig}} --status open --sort updated --reverse --limit 20 --json`
+- Recent accepted rig results/fixes:
+  `gc bd list --label status:accepted --metadata-field gc.rig={{rig}} --all --sort updated --reverse --limit 20 --json`
+  If this run hits a blocker that a recent accepted sibling already fixed,
+  incorporate or inherit that accepted fix before classifying this run as
+  blocked or scientifically negative.
+- Goal of THIS run (from `{{idea}}` + `{{idea_description}}` — the delta)
+- Approach + file-level scope
+- **Infra / correctness acceptance criteria** (reviewer gates here)
+- **Research metric** (record only; NOT a reviewer gate)
+- Expected failure modes
+- Out of scope
+
+If `{{idea_description}}` conflicts with PROJECT.md non-negotiables, STOP:
+write a one-line conflict note to plan.md and exit 1.
+
+Initialize run.json with the current iteration and empty legs map if missing.
+This is a local artifact for humans/backward compatibility. New leg state is
+stored on the convergence root metadata (`gc.leg.*`).
+
+```bash
+if [ ! -f "$RUN_DIR/plan.md" ]; then
+  # YOU (mayor) write plan.md here by composing from PROJECT.md + idea vars.
+  # See the owning rig mayor prompt for the required sections.
+  # This is a placeholder — do the actual work inline, not via subshells.
+  :
+fi
+
+# Init run.json if missing
+if [ ! -f "$RUN_DIR/run.json" ]; then
+  jq -n --arg root "$ROOT_DIR_ID" --arg wisp "$WISP_ROOT" --arg idea "{{idea}}" \\
+        --arg rig "{{rig}}" --argjson iter "$ITERATION" \\
+    '{convergence_root:$root, wisp_root:$wisp, idea:$idea, rig:$rig, iteration:$iter, legs:{}}' \\
+    > "$RUN_DIR/run.json"
+fi
+```
+
+## 3. Dispatch bounded implement attempt legs and BLOCK until one validates
+
+```bash
+THREAD_ID=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_id" // .[0].metadata."gc.lineage_root" // empty')
+THREAD_ID="${THREAD_ID:-$ROOT_DIR_ID}"
+THREAD_TITLE=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_title" // .[0].title // empty')
+THREAD_TITLE="${THREAD_TITLE:-{{idea}}}"
+CHILD_BASE_META=$(jq -n --arg rig "{{rig}}" --arg parent "$ROOT_DIR_ID" --arg thread "$THREAD_ID" --arg title "$THREAD_TITLE" --arg wt "$WORKTREE_DIR" \
+  '{"gc.rig":$rig,"gc.parent_run":$parent,"gc.thread_id":$thread,"gc.thread_title":$title,"gc.worktree_dir":$wt}')
+
+# Policy-driven artifact validation happens between attempt beads. This keeps
+# retries as separate Gas City work items instead of letting one implementer
+# repeatedly launch writers into the same run directory.
+# The mechanical validation/promotion rules live in evaluate_iteration_ops.sh.
+MAX_ATTEMPTS="${GC_MAX_IMPLEMENT_ATTEMPTS:-3}"
+SELECTED_ATTEMPT=""
+SELECTED_ATTEMPT_DIR=""
+
+for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+  ATTEMPT_RUN_DIR="$RUN_DIR/attempt-$ATTEMPT"
+  mkdir -p "$ATTEMPT_RUN_DIR"
+
+  IMPL_KEY="implement_iter_${ITERATION}_attempt_${ATTEMPT}"
+  IMPL_META_KEY="gc.leg.$IMPL_KEY"
+  IMPL_BEAD=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r --arg k "$IMPL_META_KEY" '.[0].metadata[$k] // empty')
+  if [ -z "$IMPL_BEAD" ] && [ -f "$RUN_DIR/run.json" ]; then
+    IMPL_BEAD=$(jq -r --arg k "$IMPL_KEY" '.legs[$k] // empty' "$RUN_DIR/run.json")
+  fi
+
+if [ -z "$IMPL_BEAD" ]; then
+    PREFLIGHT_SECTION=""
+    if [ "{{rig}}" = "park-manip" ]; then
+      PREFLIGHT_SECTION="
+
+Pre-flight: run 'bash scripts/preflight.sh' before making edits. It exits 0 if the bm_generalist_compat shim and IsaacLab replay path are importable; non-zero means the environment is broken and you should stop and fix it before starting work."
+    fi
+    PREVIOUS_FAILURES=""
+    if [ "$ATTEMPT" -gt 1 ]; then
+      PREVIOUS_FAILURES="
+
+Previous attempt validation failures:
+$(find "$RUN_DIR" -maxdepth 2 -name validation_failed.txt -print -exec sh -c 'printf -- "- %s: " "$1"; cat "$1"' sh {} \\; 2>/dev/null)"
+    fi
+    IMPL_DESC=$(cat <<EOF
+Implement ONE bounded attempt for the plan at $RUN_DIR/plan.md.
+
+Iteration: $ITERATION
+Attempt: $ATTEMPT of $MAX_ATTEMPTS
+
+**Work inside the worktree** — this convergence has its own git worktree
+and branch so parallel runs don't collide:
+
+  cd $WORKTREE_DIR
+  # You are on branch $BRANCH_NAME$PREFLIGHT_SECTION
+
+Inputs: $RUN_DIR/plan.md (your spec)
+$([ "$ITERATION" -gt 1 ] && echo "Plus $RUN_DIR/review.md — previous iteration's review; address its Delta spec.")
+$PREVIOUS_FAILURES
+Recent accepted fixes in this rig may be relevant. Before closing as blocked,
+check whether the blocker is already fixed by an accepted sibling branch:
+  gc bd list --label status:accepted --metadata-field gc.rig={{rig}} --all --sort updated --reverse --limit 20 --json
+If a sibling fix applies, merge/cherry-pick it into this convergence worktree,
+rerun the relevant smoke/metrics, and document the inherited fix.
+
+Required outputs in $ATTEMPT_RUN_DIR/:
+- implementation.md
+- metrics.json (must include every field plan.md's infra criteria list)
+- metrics.md (human-readable interpretation)
+- every requested video/plot/media artifact
+- progress.jsonl for GPU/MJX/differentiable-physics attempts, with JSON lines
+  for compile/smoke/train/render/done phases. Each line should include elapsed
+  seconds, phase, step when available, loss when available, and whether
+  gradients are finite when available.
+
+This bead owns exactly ONE implementation attempt. Do not run hyperparameter
+fallback loops inside this bead. If the first bounded run fails or produces a
+negative/invalid metric, document it honestly in metrics.md and close this bead;
+the coordinator will create the next Gas City attempt bead.
+
+For GPU/MJX work, do not spend a full GPU-hour before proving the run is
+observable. The first executable path must compile, run a tiny smoke budget, and
+write progress artifacts within 15 minutes. If the previous attempt timed out
+without final artifacts, scale this attempt down to a diagnostic configuration
+that can return useful metrics/media instead of repeating the same expensive
+shape silently. Examples: fewer optimization steps, reduced horizon, fewer
+smoothing samples, or profiling the slow kernel. Record the scale-down honestly
+in metrics.md/metrics.json; the coordinator/mayor will decide the next Gas City
+followup.
+Post-training evaluation/rendering is part of the same budget. If line search,
+seed search, or video rendering is slow, cap it to the first useful partial
+result and produce a small inspectable video/contact sheet plus metrics rather
+than timing out with no final artifacts.
+
+For any command that writes metrics, videos, plots, or source artifacts under
+$ATTEMPT_RUN_DIR, use the one-shot attempt runner. Do not call the script
+directly. This prevents both concurrent duplicate writers and later reruns
+after a timeout:
+
+  /home/ubuntu/bright-lights/assets/scripts/convergence/run_attempt_once.sh "$ATTEMPT_RUN_DIR" bash -lc '<your bounded command here>'
+
+For GPU/MJX work, the bounded command MUST claim an actually free GPU before
+training/rendering. Source the allocator in the same shell command:
+
+  /home/ubuntu/bright-lights/assets/scripts/convergence/run_attempt_once.sh "$ATTEMPT_RUN_DIR" bash -lc 'source /home/ubuntu/bright-lights/assets/scripts/claim_gpu_env.sh && test -n "$CUDA_VISIBLE_DEVICES" && <your bounded command here>'
+
+If the allocator leaves CUDA_VISIBLE_DEVICES empty, do not run training. Write
+metrics.md/implementation.md explaining capacity-blocked and close the attempt;
+the coordinator/curator can retry later. Do not default to cuda:0.
+
+If `.gc_attempt_started` exists, the attempt budget is already consumed. Inspect
+run.log or other artifacts; do NOT rerun the script for debugging. If the run
+timed out or failed before artifacts were produced, document that in metrics.md
+and close this attempt bead. The coordinator will create the next Gas City
+attempt bead.
+Long GPU/MJX runs must use an explicit budget (timeout, fixed iteration count,
+or equivalent) and tee logs into $ATTEMPT_RUN_DIR.
+Use unbuffered Python (`python -u` or `PYTHONUNBUFFERED=1`) and flush progress
+prints so `run.log` and `progress.jsonl` update while the process is alive.
+
+Commit your changes on branch $BRANCH_NAME before closing this bead:
+  cd $WORKTREE_DIR && git add -A && git commit -m "iter $ITERATION attempt $ATTEMPT: <summary>" || true
+
+Close THIS bead when done. Do NOT close the convergence root.
+EOF
+)
+    IMPL_BEAD=$(cd "$RIG_SRC" && gc bd create "implement-iter-$ITERATION-attempt-$ATTEMPT: {{idea}}" -d "$IMPL_DESC" --parent "$STEP_BEAD" --json | jq -r '.id')
+    IMPL_META=$(printf '%s\n' "$CHILD_BASE_META" | jq --arg target "$IMPLEMENTER_TARGET" --arg attempt "$ATTEMPT" --arg attempt_dir "$ATTEMPT_RUN_DIR" '. + {"gc.routed_to":$target,"gc.attempt":$attempt,"gc.attempt_run_dir":$attempt_dir}')
+    gc bd update "$IMPL_BEAD" --metadata "$IMPL_META"
+    gc bd update "$ROOT_DIR_ID" --set-metadata "$IMPL_META_KEY=$IMPL_BEAD"
+    gc bd update "$ROOT_DIR_ID" --set-metadata "gc.leg.latest_implement=$IMPL_BEAD"
+    gc sling "$IMPLEMENTER_TARGET" "$IMPL_BEAD" --nudge --no-convoy --force >/dev/null 2>&1 || true
+  fi
+
+  # Coordinator must only wait/repair/nudge here. It must not write attempt
+  # files or run the implementer's command itself.
+  # BLOCK until this attempt closes. Run this short-sleep loop as written.
+  # Do not replace it with long `sleep 300`/`sleep 600` checks or background
+  # polls; long sleeps make completed attempts look stalled.
+  for i in $(seq 1 480); do
+    STATUS=$(gc bd show "$IMPL_BEAD" --json 2>/dev/null | jq -r '(if type=="array" then .[0] else . end).status // "?"')
+    [ "$STATUS" = "closed" ] && break
+    if [ $((i % 10)) -eq 0 ]; then
+      gc sling "$IMPLEMENTER_TARGET" "$IMPL_BEAD" --nudge --no-convoy --force >/dev/null 2>&1 || true
+    fi
+    sleep 30
+  done
+
+  if [ "$STATUS" != "closed" ]; then
+    echo "FAIL: implement attempt $ATTEMPT bead $IMPL_BEAD did not close within 4h"
+    exit 1
+  fi
+
+  if "$EVALUATE_OPS" validate-attempt "$ATTEMPT_RUN_DIR" "{{rig}}"; then
+    SELECTED_ATTEMPT="$ATTEMPT"
+    SELECTED_ATTEMPT_DIR="$ATTEMPT_RUN_DIR"
+    "$EVALUATE_OPS" promote-attempt "$ATTEMPT_RUN_DIR" "$RUN_DIR" "$ROOT_DIR_ID" "$ATTEMPT"
+    break
+  fi
+
+  gc bd update "$IMPL_BEAD" --set-metadata gc.validation=failed --append-notes "Attempt $ATTEMPT failed coordinator validation: $(cat "$ATTEMPT_RUN_DIR/validation_failed.txt" 2>/dev/null)" >/dev/null 2>&1 || true
+done
+
+if [ -z "$SELECTED_ATTEMPT_DIR" ]; then
+  echo "FAIL: no implement attempt validated after $MAX_ATTEMPTS attempts"
+  gc bd update "$ROOT_DIR_ID" --set-metadata gc.result_class=IMPLEMENTATION_BUG --set-metadata gc.failure_class=no-valid-implementation-attempt >/dev/null 2>&1 || true
+  exit 1
+fi
+```
+
+## 4. Dispatch review leg and BLOCK until it closes
+
+```bash
+REV_KEY="review_iter_$ITERATION"
+REV_META_KEY="gc.leg.$REV_KEY"
+REV_BEAD=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r --arg k "$REV_META_KEY" '.[0].metadata[$k] // empty')
+if [ -z "$REV_BEAD" ] && [ -f "$RUN_DIR/run.json" ]; then
+  REV_BEAD=$(jq -r --arg k "$REV_KEY" '.legs[$k] // empty' "$RUN_DIR/run.json")
+fi
+
+if [ -z "$REV_BEAD" ]; then
+  REV_DESC=$(cat <<EOF
+Adversarially review the implementation of "{{idea}}" (iteration $ITERATION).
+
+**Work inside the worktree**:
+  cd $WORKTREE_DIR
+  git log --oneline -20
+  git diff $BRANCH_NAME^..$BRANCH_NAME     # this iteration's diff
+
+Judge artifacts at $RUN_DIR/:
+- plan.md (what was asked)
+- implementation.md (what was done)
+- metrics.json + metrics.md
+- required media/plots under $RUN_DIR/ (video is mandatory when rig policy
+  has gc.policy.require_media=true)
+- review_artifacts/video_contact_sheets/ when present. If an active policy
+  requires visible robot video, inspect the contact sheets and REJECT if the
+  robot is missing, mostly outside the frame, or the before/after evidence is
+  not usable.
+
+Produce $RUN_DIR/review.md ending with EXACTLY ONE line:
+  VERDICT: ACCEPTED | REJECTED | NEEDS_TAKARA
+
+**Your rubric** (per $RIG_SRC/PROJECT.md):
+- ACCEPTED: code correct, metrics honest, all infra criteria in plan.md met.
+  Use ACCEPTED for clean negative research too when the run honestly
+  eliminates a hypothesis or identifies an obvious next lever. State
+  `NEGATIVE_RESEARCH_SIGNAL` in review.md so the coordinator/curator can
+  continue autonomously.
+- REJECTED: broken code, dishonest metrics, silent crash, scope violation,
+  or missing infra criterion. Include a concrete Delta spec.
+- NEEDS_TAKARA: clean code + honest metrics but the research outcome
+  genuinely needs human judgment, credentials/access, or a project-scope
+  choice. This should be rare in autonomous mode. Do not use it merely
+  because the method failed or because the result is scientifically negative.
+
+Close THIS bead when done. Do NOT close the convergence root.
+EOF
+)
+  REV_BEAD=$(cd "$RIG_SRC" && gc bd create "review-iter-$ITERATION: {{idea}}" -d "$REV_DESC" --parent "$STEP_BEAD" --json | jq -r '.id')
+  REV_META=$(printf '%s\n' "$CHILD_BASE_META" | jq --arg target "$REVIEWER_TARGET" '. + {"gc.routed_to":$target}')
+  gc bd update "$REV_BEAD" --metadata "$REV_META"
+  gc bd update "$ROOT_DIR_ID" --set-metadata "$REV_META_KEY=$REV_BEAD"
+  gc bd update "$ROOT_DIR_ID" --set-metadata "gc.leg.latest_review=$REV_BEAD"
+  # Metadata-routed; the reviewer pool wakes via scale_check/work_query.
+fi
+
+# BLOCK until reviewer closes the bead. Run this short-sleep loop as written.
+# Do not replace it with long fixed sleeps or background polls.
+for i in $(seq 1 240); do
+  STATUS=$(gc bd show "$REV_BEAD" --json 2>/dev/null | jq -r '.[0].status // "?"')
+  [ "$STATUS" = "closed" ] && break
+  sleep 30
+done
+
+if [ "$STATUS" != "closed" ]; then
+  echo "FAIL: review leg $REV_BEAD did not close within 2h"
+  exit 1
+fi
+
+# Verify reviewer produced review.md with a VERDICT line
+if [ ! -f "$RUN_DIR/review.md" ]; then
+  echo "FAIL: reviewer closed bead but did not produce review.md"
+  exit 1
+fi
+
+VERDICT=$(grep -E '^VERDICT:' "$RUN_DIR/review.md" | tail -1 | awk '{print $2}')
+if [ -z "$VERDICT" ]; then
+  echo "FAIL: review.md exists but has no VERDICT line"
+  exit 1
+fi
+
+echo "iter $ITERATION verdict: $VERDICT"
+
+THREAD_ID=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_id" // .[0].metadata."gc.lineage_root" // empty')
+THREAD_ID="${THREAD_ID:-$ROOT_DIR_ID}"
+THREAD_TITLE=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_title" // .[0].title // empty')
+THREAD_TITLE="${THREAD_TITLE:-{{idea}}}"
+
+"$EVALUATE_OPS" sync-artifacts "$ROOT_DIR_ID" "$ITERATION" "$RUN_DIR" "$VERDICT" \\
+  "$THREAD_ID" "$THREAD_TITLE" "{{rig}}"
+```
+
+## 5. Synthesize thread state, then write followups — ACCEPTED always; NEEDS_TAKARA only if curator is running
+
+Curator is the kill-switch for the autonomous loop. If the operator has
+an open `kind:control` / `control:curator` pause bead, NEEDS_TAKARA halts
+the chain — human decides what's next.
+If curator is running, NEEDS_TAKARA is treated like ACCEPTED for the
+purpose of generating followups: the coordinator proposes fresh levers to try,
+curator dedups against dead-ends, the loop keeps going.
+
+Rationale: for research problems (T-pose hold, conditioning surfaces,
+etc.) the system rarely hits ACCEPTED on first try. Stalling on
+NEEDS_TAKARA forces the human to re-seed every time. Instead, keep
+the loop going by default — the operator can pause curator when they
+want to intervene.
+
+```bash
+CURATOR_PAUSED=false
+if gc bd list --label kind:control --status open --json 2>/dev/null | jq -e '
+  .[]? |
+  select((.labels // []) | index("control:curator")) |
+  select(.metadata["gc.control_type"] == "curator_pause") |
+  select(.metadata["gc.pause_scope"] == "city")
+' >/dev/null; then
+  CURATOR_PAUSED=true
+fi
+
+WRITE_FOLLOWUPS=false
+if [ "$VERDICT" = "ACCEPTED" ]; then
+  WRITE_FOLLOWUPS=true
+elif [ "$VERDICT" = "NEEDS_TAKARA" ] && [ "$CURATOR_PAUSED" = "false" ]; then
+  WRITE_FOLLOWUPS=true
+fi
+
+THREAD_ID=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_id" // .[0].metadata."gc.lineage_root" // empty')
+THREAD_ID="${THREAD_ID:-$ROOT_DIR_ID}"
+THREAD_TITLE=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.thread_title" // .[0].title // empty')
+THREAD_TITLE="${THREAD_TITLE:-{{idea}}}"
+case "{{rig}}" in
+  mjx-diffphysics) RIG_MAYOR="mjx-mayor" ;;
+  park-manip) RIG_MAYOR="park-mayor" ;;
+  robotics-bench) RIG_MAYOR="robotics-mayor" ;;
+  *) RIG_MAYOR="{{rig}}-mayor" ;;
+esac
+SYNTHESIS_ID="{{rig}}-mayor"
+SYNTHESIS_TITLE="{{rig}} mayor synthesis"
+SYNTHESIS_DIR="/home/ubuntu/bright-lights/research_threads/$SYNTHESIS_ID"
+mkdir -p "$SYNTHESIS_DIR"
+SYNTHESIS_BEAD=$(gc bd list --label kind:synthesis --metadata-field "gc.synthesis_scope=rig_mayor" --metadata-field "gc.rig={{rig}}" --status open --json 2>/dev/null | jq -r '.[0].id // empty')
+
+if [ "$WRITE_FOLLOWUPS" = "true" ]; then
+  PARENT_DEPTH=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.lineage_depth" // "0"')
+  CHILD_DEPTH=$((PARENT_DEPTH + 1))
+  LINEAGE_ROOT=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."gc.lineage_root" // empty')
+  LINEAGE_ROOT="${LINEAGE_ROOT:-$ROOT_DIR_ID}"
+  PARENT_RIG=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '.[0].metadata."var.rig" // .[0].metadata."gc.rig" // empty')
+  PARENT_RIG="${PARENT_RIG:-{{rig}}}"
+
+  # FIRST: update the rig-mayor synthesis before proposing anything new.
+  # The user-facing thread is the persistent rig mayor conversation. Individual
+  # runs and lineages remain Beads underneath it; `gc.thread_id` is internal
+  # compatibility metadata, not a separate chat/thread UI object.
+  #
+  # Write/append $SYNTHESIS_DIR/synthesis.md and $SYNTHESIS_DIR/decision_log.md as
+  # human-readable artifacts, then mirror the current synthesis into a
+  # rig-mayor `kind:synthesis` bead so Gas City can index durable memory. Include:
+  # - current goal and best run so far
+  # - active method/idea lanes (use gc.method_family or gc.research_lane)
+  # - accepted facts
+  # - negative results / dead ends
+  # - implementation bugs versus research failures
+  # - reusable fixes/learnings that should affect other lanes/runs
+  # - recommended next move and why it is higher value than siblings
+  #
+  # Also stamp the run with a result class. Use exactly one:
+  # ACCEPTED_RESEARCH_SIGNAL, NEGATIVE_RESEARCH_SIGNAL, IMPLEMENTATION_BUG,
+  # REVIEWER_BLOCKED, INFRA_BLOCKED, SPEC_AMBIGUOUS.
+  # If a fix is reusable outside this branch, also stamp gc.global_learning=true
+  # and summarize it in gc.learning_summary.
+  #
+  # Example:
+  #   gc bd update "$ROOT_DIR_ID" --set-metadata gc.result_class=NEGATIVE_RESEARCH_SIGNAL
+  #   gc bd update "$ROOT_DIR_ID" --set-metadata gc.global_learning=true \
+  #     --set-metadata gc.learning_summary="preflight catches missing IsaacLab import before GPU runs"
+  #
+  # After writing $SYNTHESIS_DIR/synthesis.md, sync the Bead:
+  #   SYN_META=$(jq -n --arg rig "$PARENT_RIG" --arg mayor "$RIG_MAYOR" --arg sid "$SYNTHESIS_ID" \
+  #     '{"gc.synthesis_scope":"rig_mayor","gc.synthesis_id":$sid,"gc.rig":$rig,"gc.rig_mayor":$mayor,"gc.kind":"rig_mayor_synthesis"}')
+  #   if [ -z "$SYNTHESIS_BEAD" ]; then
+  #     SYNTHESIS_BEAD=$(gc bd create "synthesis: $SYNTHESIS_TITLE" --type decision \
+  #       --body-file "$SYNTHESIS_DIR/synthesis.md" \
+  #       -l "kind:synthesis,status:active,rig:$PARENT_RIG" \
+  #       --metadata "$SYN_META" --json | jq -r '.id')
+  #   else
+  #     gc bd update "$SYNTHESIS_BEAD" --body-file "$SYNTHESIS_DIR/synthesis.md" --metadata "$SYN_META"
+  #   fi
+  #   gc bd update "$ROOT_DIR_ID" --set-metadata "gc.rig_synthesis=$SYNTHESIS_BEAD"
+  #
+  # If the run failed because of a code/spec bug, do NOT fan out scientific
+  # hypotheses. File one bugfix/retry proposal in the same thread instead.
+  #
+  # Before filing proposals, scan cross-thread learnings:
+  #   gc bd list --has-metadata-key gc.global_learning --limit 100 --json
+  # Incorporate relevant fixes into each proposal's spec so a bug fixed in
+  # one branch can improve siblings and other lanes.
+
+  # THEN: propose 0-2 concrete followups by default. File more only when the
+  # alternatives are genuinely independent and GPU-parallelizable. Each
+  # followup is a fresh `kind:proposal` bead with lineage + compatibility metadata so
+  # curator-decide can promote it into evaluate-idea.
+  #
+  # **Verdict affects followup character**:
+  # - ACCEPTED: propose exploitation ideas (scale, generalize, refine).
+  # - NEEDS_TAKARA: propose NEW LEVERS to try on the same problem. The
+  #   previous run honestly failed; exhaust the remaining in-scope levers
+  #   (different loss weights, different init, different optimizer, etc.)
+  #   before giving up. Each followup should try ONE distinct lever so
+  #   curator can dedup properly.
+  #
+  # Template for one followup:
+  #   FOLLOWUP_TITLE="..."; FOLLOWUP_DESC="..."
+  #   FOLLOWUP_KIND="same-thread"   # one of: same-thread, new-thread, bugfix, cross-thread
+  #   METHOD_FAMILY="..."           # e.g. shac, bptt, colocation, cmaes, guidance, infra
+  #   # Required for backward compatibility: gc.thread_id and gc.followup_kind.
+  #   # The user-facing thread remains the rig mayor conversation.
+  #   # same-thread: tests the same lane/question.
+  #   # new-thread: internal lane split when the core question or method family changes.
+  #   # bugfix: fixes implementation/infra/spec reliability; no hypothesis fanout.
+  #   # cross-thread: reusable fix/learning that should be pulled into siblings.
+  #   META=$(jq -n --arg root "$LINEAGE_ROOT" --arg parent "$ROOT_DIR_ID" \\
+  #     --argjson depth $CHILD_DEPTH --arg desc "$FOLLOWUP_DESC" --arg rig "$PARENT_RIG" \\
+  #     --arg thread "$THREAD_ID" --arg thread_title "$THREAD_TITLE" --arg kind "$FOLLOWUP_KIND" --arg method "$METHOD_FAMILY" \\
+  #     '{"gc.lineage_root":$root,"gc.parent_run":$parent,"gc.lineage_depth":($depth|tostring),"gc.proposal_idea_desc":$desc,"gc.rig":$rig,"gc.thread_id":$thread,"gc.thread_title":$thread_title,"gc.followup_kind":$kind,"gc.method_family":$method}')
+  #   cd /home/ubuntu/bright-lights
+  #   gc bd create "$FOLLOWUP_TITLE" -d "$FOLLOWUP_DESC" \\
+  #     -l "kind:proposal,status:pending" --metadata "$META"
+  #
+  # New-lane proposals should explain the split in gc.thread_reason:
+  #   gc bd update "$PROPOSAL_ID" --set-metadata gc.thread_reason="method lane split: SHAC vs co-location"
+  #
+  # Filing zero proposals is valid ONLY if every obvious in-scope lever
+  # is exhausted (then the curator will see no new proposals and the loop
+  # naturally ends). On NEEDS_TAKARA, strongly prefer filing at least one.
+  # Write a human-readable $RUN_DIR/followups.md summarizing what you filed.
+  :
+fi
+
+if [ "$CURATOR_PAUSED" = "true" ] && [ "$VERDICT" = "NEEDS_TAKARA" ]; then
+  echo "curator paused; NEEDS_TAKARA terminates without followups (human decision required)"
+fi
+
+# Gascity's controller only evaluates the gate after the active wisp closes.
+# Finalization is handled by evaluate_iteration_ops.sh so prompt text does not
+# duplicate the attached-wisp close mechanics.
+ACTIVE_WISP=$(gc bd show "$ROOT_DIR_ID" --json 2>/dev/null | jq -r '(if type=="array" then .[0] else . end).metadata."convergence.active_wisp" // empty')
+WISP_TO_CLOSE="${ACTIVE_WISP:-$WISP_ROOT}"
+if [ -z "$STEP_BEAD" ] || [ "$STEP_BEAD" = "$WISP_TO_CLOSE" ]; then
+  STEP_BEAD="$WISP_TO_CLOSE.1"
+fi
+"$EVALUATE_OPS" finalize "$ROOT_DIR_ID" "$ITERATION" "$RUN_DIR" "$VERDICT" \\
+  "$THREAD_ID" "$THREAD_TITLE" "{{rig}}" "$STEP_BEAD" "$WISP_TO_CLOSE"
+```
+
+## 6. Exit
+
+When this script closes the coordinator step, Gas City's `on_close` hook
+closes the attached wisp. The convergence controller then runs the gate
+(prompts/convergence/gate.sh), which reads review.md and exits 0 (pass =
+terminate) or 1 (fail = iterate).
+
+If ITERATION < max_iterations AND verdict is REJECTED, the controller
+spawns the next iteration: this same script re-runs, plan.md + root bead
+metadata are idempotent, new impl/review legs get dispatched, review.md is
+overwritten with the new iteration's verdict.
+
+If verdict is ACCEPTED or NEEDS_TAKARA, the gate terminates successfully
+on the next tick.
+"""

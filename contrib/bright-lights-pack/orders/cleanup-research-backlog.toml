@@ -1,0 +1,5 @@
+[order]
+description = "Clean stale curator/proposal bookkeeping so the research loop does not replay old work."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/maintenance/cleanup_research_backlog.sh"

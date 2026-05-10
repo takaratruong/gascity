@@ -1,0 +1,5 @@
+[order]
+description = "Release proposal beads held for an active sibling once that sibling convergence has closed."
+trigger = "cooldown"
+interval = "1m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/curator/release_held_active_siblings.sh"

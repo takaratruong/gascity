@@ -1,0 +1,20 @@
+# Gas City
+.gc/
+.beads/
+hooks/
+.runtime/
+.claude/
+.nudger_state/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Runtime logs and local scratch
+*.log
+__pycache__/
+*.pyc
+hello-world/
+research_threads/bl-*/
+assets/archive/

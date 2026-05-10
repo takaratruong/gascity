@@ -1,0 +1,26 @@
+[pack]
+name = "bright-lights"
+schema = 2
+
+# Research control is rig-local: the dashboard talks to the selected rig's
+# mayor directly. Blocking evaluate-idea execution is handled by coordinators,
+# so mayors remain responsive for chat, synthesis, and strategy.
+# Agents are discovered by convention from agents/<name>/.
+
+[[named_session]]
+template = "park-mayor"
+mode = "always"
+
+[[named_session]]
+template = "mjx-mayor"
+mode = "always"
+
+[[named_session]]
+template = "robotics-mayor"
+mode = "always"
+
+# The curator is no longer an always-on LLM session. Its work is split into
+# native orders (assets/scripts/curator/label_runs.sh, dispatch_proposals.sh) plus a
+# per-proposal `curator-decide` formula dispatched to curator-decider. The
+# agents/curator/ prompt is retained for reference but the agent is not
+# declared as a named_session.

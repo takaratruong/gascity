@@ -1,0 +1,4 @@
+nudge = "Run gc hook; check mail; claim work routed to mjx-mayor; coordinate mjx-diffphysics research only."
+min_active_sessions = 0
+max_active_sessions = 1
+sleep_after_idle = "off"

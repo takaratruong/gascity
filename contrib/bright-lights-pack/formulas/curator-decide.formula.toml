@@ -1,0 +1,420 @@
+description = """
+One-step formula: read a single proposal bead, dedup against accepted +
+dead-end registries using LLM judgment, and either promote (sling a new
+evaluate-idea convergence) or skip (label + close the proposal).
+
+Dispatched by the curator proposal event order, one instance per proposal.
+Runs on curator-decider. Novel proposals are promoted to the owning rig's
+coordinator, not to a city-wide mayor. The rig mayor remains the chat and
+strategy partner.
+
+Required var:
+  proposal_id — the kind:proposal bead ID to process
+"""
+formula = "curator-decide"
+version = 1
+
+[vars]
+[vars.proposal_id]
+description = "The bead ID of the proposal to process"
+required = true
+
+[[steps]]
+id = "decide"
+title = "Dedup + promote proposal {{proposal_id}}"
+description = """
+You are running a per-proposal decision cycle. Your ONLY job is to
+process proposal bead `{{proposal_id}}` and decide: promote (fire a new
+evaluate-idea convergence) or skip (close the proposal with a reason).
+
+## 1. Read the proposal
+
+```bash
+PROPOSAL_ID="{{proposal_id}}"
+PBD=$(gc bd show "$PROPOSAL_ID" --json 2>&1 | jq -c '.[0]')
+curator_decision_event() {
+  local category="$1"
+  local summary="$2"
+  local payload="$3"
+  gc event emit "curator_decide.$category" \
+    --actor "curator-decider" \
+    --subject "$PROPOSAL_ID" \
+    --message "$summary" \
+    --payload "$payload" >/dev/null 2>&1 || true
+}
+P_TITLE=$(echo "$PBD" | jq -r '.title')
+P_DESC=$(echo "$PBD" | jq -r '.description // ""')
+P_LINEAGE_ROOT=$(echo "$PBD" | jq -r '.metadata["gc.lineage_root"] // empty')
+P_PARENT_RUN=$(echo "$PBD" | jq -r '.metadata["gc.parent_run"] // empty')
+P_DEPTH=$(echo "$PBD" | jq -r '.metadata["gc.lineage_depth"] // "0"')
+P_IDEA_DESC=$(echo "$PBD" | jq -r '.metadata["gc.proposal_idea_desc"] // .description')
+P_THREAD_ID=$(echo "$PBD" | jq -r '.metadata["gc.thread_id"] // empty')
+P_THREAD_TITLE=$(echo "$PBD" | jq -r '.metadata["gc.thread_title"] // empty')
+P_FOLLOWUP_KIND=$(echo "$PBD" | jq -r '.metadata["gc.followup_kind"] // empty')
+P_THREAD_REASON=$(echo "$PBD" | jq -r '.metadata["gc.thread_reason"] // empty')
+P_RIG=$(echo "$PBD" | jq -r '.metadata["gc.rig"] // "park-manip"')
+P_METHOD_FAMILY=$(echo "$PBD" | jq -r '.metadata["gc.method_family"] // .metadata["gc.research_lane"] // empty')
+P_UPDATED_AT=$(echo "$PBD" | jq -r '.updated_at // .created_at // ""')
+POLICY_JSON=$(timeout 12s gc bd list --label kind:policy --label "rig:$P_RIG" --status open --sort updated --reverse --limit 20 --json 2>/dev/null || printf '[]')
+OPERATOR_POLICIES=$(printf '%s\n' "$POLICY_JSON" | \
+  jq -r '.[] | "- " + .id + ": " + (.title // "") + " — " + (.description // "")' | head -20)
+
+# Safety: proposal must still be open and not already decided. The label
+# check catches the common double-promotion race (two decide wisps race,
+# both land here, but only one sees status:promoted clean). Not a strict
+# atomicity primitive — just narrows the window.
+STATUS=$(echo "$PBD" | jq -r '.status')
+if [ "$STATUS" != "open" ]; then
+  echo "proposal $PROPOSAL_ID already $STATUS; nothing to do"
+  exit 0
+fi
+LABELS=$(echo "$PBD" | jq -r '(.labels // []) | join(",")')
+if echo "$LABELS" | grep -qE '(^|,)(status:promoted|status:skipped-dedup|status:skipped-duplicate)(,|$)'; then
+  echo "proposal $PROPOSAL_ID already decided (labels: $LABELS); nothing to do"
+  exit 0
+fi
+
+# Stale lineage guard: if a proposal predates a newer accepted run in the same
+# rig+lineage, and it is not explicitly following that accepted run, close it
+# instead of promoting old backlog. This keeps the research loop moving forward
+# from the latest evidence instead of replaying stale siblings that were filed
+# before the accepted lesson existed.
+if [ -n "$P_LINEAGE_ROOT" ] && [ -n "$P_UPDATED_AT" ]; then
+  LATEST_ACCEPTED=$(timeout 12s gc bd list --all --label status:accepted --metadata-field "gc.rig=$P_RIG" --metadata-field "gc.lineage_root=$P_LINEAGE_ROOT" --sort updated --reverse --limit 100 --json 2>/dev/null | jq -r \
+    --arg rig "$P_RIG" \
+    --arg lineage "$P_LINEAGE_ROOT" \
+    --arg proposal_updated "$P_UPDATED_AT" '
+    [
+      .[]
+      | select((.metadata["gc.rig"] // .metadata["var.rig"] // "") == $rig)
+      | select((.metadata["gc.lineage_root"] // "") == $lineage)
+      | select((.updated_at // .created_at // "") > $proposal_updated)
+      | {id, updated_at:(.updated_at // .created_at // ""), title:(.title // ""), learning:(.metadata["gc.learning_summary"] // "")}
+    ]
+    | sort_by(.updated_at)
+    | reverse
+    | .[0]
+    | select(.id != null)
+    | [.id, .updated_at, .title, .learning] | @tsv
+  ' | head -1)
+  if [ -n "$LATEST_ACCEPTED" ]; then
+    ACCEPTED_ID=$(printf '%s\n' "$LATEST_ACCEPTED" | cut -f1)
+    ACCEPTED_TITLE=$(printf '%s\n' "$LATEST_ACCEPTED" | cut -f3)
+    ACCEPTED_LEARNING=$(printf '%s\n' "$LATEST_ACCEPTED" | cut -f4-)
+    if [ "$P_PARENT_RUN" != "$ACCEPTED_ID" ]; then
+      REASON="stale proposal predates newer accepted lineage result $ACCEPTED_ID ($ACCEPTED_TITLE). Latest learning: $ACCEPTED_LEARNING"
+      echo "proposal $PROPOSAL_ID skipped as stale lineage backlog: $REASON"
+      STALE_META=$(jq -n --arg match "$ACCEPTED_ID" --arg reason "$REASON" \
+        '{"gc.decision":"skipped-stale-lineage","gc.dedup_match":$match,"gc.decision_reason":$reason}')
+      gc bd update "$PROPOSAL_ID" --metadata "$STALE_META"
+      gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:skipped-stale-lineage --add-label status:dead-end
+      curator_decision_event "skipped-stale-lineage" "skipped $PROPOSAL_ID behind accepted $ACCEPTED_ID" "$STALE_META"
+      gc bd close "$PROPOSAL_ID" --reason "$REASON"
+      exit 0
+    fi
+  fi
+fi
+
+# Thread metadata is required for followups. Root seeds may omit thread_id
+# because they create a new conceptual thread when promoted.
+if [ -n "$P_PARENT_RUN" ]; then
+  if [ -z "$P_LINEAGE_ROOT" ]; then
+    echo "proposal $PROPOSAL_ID missing gc.lineage_root; holding for mayor repair"
+    HOLD_META=$(jq -n '{"gc.decision":"held","gc.decision_reason":"missing gc.lineage_root"}')
+    gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+    gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:missing-proposal-metadata
+    curator_decision_event "held" "held $PROPOSAL_ID: missing gc.lineage_root" "$HOLD_META"
+    exit 0
+  fi
+  case "$P_FOLLOWUP_KIND" in
+    same-thread|new-thread|bugfix|cross-thread) ;;
+    *)
+      echo "proposal $PROPOSAL_ID missing valid gc.followup_kind; holding for mayor repair"
+      HOLD_META=$(jq -n '{"gc.decision":"held","gc.decision_reason":"missing valid gc.followup_kind"}')
+      gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+      gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:missing-thread-metadata
+      curator_decision_event "held" "held $PROPOSAL_ID: missing valid gc.followup_kind" "$HOLD_META"
+      exit 0
+      ;;
+  esac
+  if [ -z "$P_THREAD_ID" ]; then
+    echo "proposal $PROPOSAL_ID missing gc.thread_id; holding for mayor repair"
+    HOLD_META=$(jq -n '{"gc.decision":"held","gc.decision_reason":"missing gc.thread_id"}')
+    gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+    gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:missing-thread-metadata
+    curator_decision_event "held" "held $PROPOSAL_ID: missing gc.thread_id" "$HOLD_META"
+    exit 0
+  fi
+else
+  P_FOLLOWUP_KIND="${P_FOLLOWUP_KIND:-new-thread}"
+fi
+
+# Generic policy rejection. Policies may define:
+#   gc.policy.match_regex      when policy applies
+#   gc.policy.reject_regex     forbidden proposal terms
+#   gc.policy.reject_reason    close reason
+PROPOSAL_TEXT="$P_TITLE
+$P_DESC
+$P_IDEA_DESC
+$P_THREAD_TITLE"
+POLICY_VIOLATION=$(printf '%s\n' "$POLICY_JSON" | jq -r --arg text "$PROPOSAL_TEXT" '
+  .[]? |
+  select(.metadata["gc.policy.reject_regex"] != null) |
+  select((.metadata["gc.policy.match_regex"] // ".*") as $m | ($text | test($m; "i"))) |
+  select(.metadata["gc.policy.reject_regex"] as $r | ($text | test($r; "i"))) |
+  [.id, (.metadata["gc.policy.reject_reason"] // .title)] | @tsv
+' | head -1)
+if [ -n "$POLICY_VIOLATION" ]; then
+  POLICY_ID=$(printf '%s\n' "$POLICY_VIOLATION" | cut -f1)
+  POLICY_REASON=$(printf '%s\n' "$POLICY_VIOLATION" | cut -f2-)
+  echo "proposal $PROPOSAL_ID violates policy $POLICY_ID: $POLICY_REASON"
+  REJECT_META=$(jq -n --arg policy "$POLICY_ID" --arg reason "$POLICY_REASON" \
+    '{"gc.decision":"operator-rejected","gc.policy_violation":$policy,"gc.decision_reason":$reason}')
+  gc bd update "$PROPOSAL_ID" --metadata "$REJECT_META"
+  gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:operator-rejected --add-label status:dead-end
+  curator_decision_event "operator-rejected" "rejected $PROPOSAL_ID by policy $POLICY_ID" "$REJECT_META"
+  gc bd close "$PROPOSAL_ID" --reason "operator-rejected: $POLICY_REASON"
+  exit 0
+fi
+
+# Backward-compatible safety net for old/unstructured policies. This should
+# become unnecessary once every active policy has gc.policy.reject_regex.
+if ! printf '%s\n' "$POLICY_JSON" | jq -e '.[]? | select(.metadata["gc.policy_scope"]=="narrow_hallway_scene_aware_motion" and .metadata["gc.policy.reject_regex"] != null)' >/dev/null; then
+  if [ "${P_RIG:-park-manip}" = "park-manip" ] || echo "$P_DESC $P_IDEA_DESC" | grep -qi 'park-manip'; then
+    if echo "$P_TITLE $P_DESC $P_IDEA_DESC $P_THREAD_TITLE" | grep -qiE 'narrow[_ -]hallway|sidestep|bl-k69twf|bl-au1p69'; then
+      if echo "$P_TITLE $P_DESC $P_IDEA_DESC" | grep -qiE 'cfg_text[[:space:]]*[=>][[:space:]]*[1-9]|cfg_text[[:space:]]*>[[:space:]]*0|text[- ]conditioning|prompt[- ]conditioning|prompt lever|prompt sweep|text prompt|re-enable text|positive[[:space:]]+.*cfg_text|cfg text[[:space:]]*>[[:space:]]*0|waypoint[_ -]?z[_ -]?offset|lateral[- ]offset waypoint|shift .*waypoint|offset .*waypoint|bow.*waypoint|reroute.*root|root[- ]path.*(offset|shift|mutat|optimiz|reroute)|mutat.*root waypoint|optimiz.*root waypoint'; then
+        echo "proposal $PROPOSAL_ID violates legacy narrow-hallway safety net"
+        gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:operator-rejected --add-label status:dead-end
+        gc bd close "$PROPOSAL_ID" --reason "operator-rejected: narrow-hallway policy violation"
+        exit 0
+      fi
+    fi
+  fi
+fi
+```
+
+## 2. Pull dedup context
+
+```bash
+# jq string-interpolation (backslash-paren) is not safe inside TOML
+# triple-double-quoted strings; that sequence is an invalid TOML escape.
+# We use jq '+' concatenation here instead.
+DEAD_ENDS=$(timeout 12s gc bd list --label status:dead-end --metadata-field "gc.rig=$P_RIG" --sort updated --reverse --limit 100 --json 2>/dev/null | \
+  jq -r '.[] | "- " + .id + ": " + (.title // "") + " — " + (.metadata["gc.proposal_idea_desc"] // .description // "")' | head -100)
+ACCEPTED=$(timeout 12s gc bd list --all --label status:accepted --metadata-field "gc.rig=$P_RIG" --sort updated --reverse --limit 100 --json 2>/dev/null | \
+  jq -r '.[] | "- " + .id + ": " + (.title // "") + " — " + (.metadata["gc.proposal_idea_desc"] // .description // "")' | head -100)
+
+echo "Active operator policies for $P_RIG:"
+printf '%s\n' "$OPERATOR_POLICIES"
+```
+
+## 3. Semantic dedup decision — YOUR judgment
+
+Read the proposal's title + idea description. Compare semantically against
+the dead-ends and accepted lists. Ignore superficial wording; judge on
+mechanism and goal. Also judge whether the proposed `gc.followup_kind` is
+correct:
+
+- `same-thread`: same core research question, different lever/variant.
+- `new-thread`: substantially different question or reusable benchmark/tooling.
+- `bugfix`: repairs implementation/spec/infra reliability; should usually
+  stay in the current thread and avoid spawning sibling hypotheses.
+- `cross-thread`: reusable fix/learning that should be applied across open
+  siblings/threads.
+
+If a proposal claims `new-thread` but is really the same question, keep it
+same-thread. If it is a bug fix, do not treat it as a scientific branch.
+
+- **Match against dead-end** → SKIP. This line of inquiry was tried and
+  failed.
+- **Match against accepted** → SKIP. Work is already done.
+- **Novel** → PROMOTE.
+
+Examples of "match":
+- "Reduce CMA-ES popsize to 15" matches a dead-end "CMA-ES popsize below 20 degraded convergence"
+- "Use E4 root-guidance with narrow passage scene" matches an accepted run on E4 narrow-passage
+Examples of "not a match":
+- "Replace CMA-ES with gradient descent" does NOT match "CMA-ES popsize was worse"
+  (different mechanism)
+- "E4 root-guidance on wide-corridor scene" does NOT match "E4 on narrow-passage"
+  (different scenario)
+
+## 4. Act
+
+**There is NO capacity check in this formula.** Do not invent one. The
+city has rig-scoped implementer slots per rig;
+they are empty most of the time. Do not defer promotion on "too many
+open convergences" — that is not your concern. Every proposal gets
+decided NOW: promote or skip-as-dedup. The operator explicitly wants
+the loop to churn.
+
+Do NOT add a `status:deferred-capacity` label. That label is forbidden.
+If you think the pool is full, you are wrong — promote anyway; the
+worst case is the new convergence waits in the queue, which is fine.
+Never close this step with a reason like "promotion deferred at cap."
+If you hit that branch in your reasoning, it is a bug — promote.
+
+### If MATCH (skip):
+
+```bash
+REASON_BEAD=""  # id of the matched accepted/dead-end bead
+REASON_TEXT=""  # one-line explanation
+DEDUP_META=$(jq -n --arg match "$REASON_BEAD" --arg reason "$REASON_TEXT" \
+  '{"gc.decision":"skipped-dedup","gc.dedup_match":$match,"gc.decision_reason":$reason}')
+gc bd update "$PROPOSAL_ID" --metadata "$DEDUP_META"
+gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:skipped-dedup
+curator_decision_event "skipped-dedup" "skipped $PROPOSAL_ID as dedup of $REASON_BEAD" "$DEDUP_META"
+gc bd close "$PROPOSAL_ID" --reason "dedup"
+```
+
+### If NOVEL (promote):
+
+```bash
+# Fire a new evaluate-idea convergence for this proposal.
+# Read the rig from the proposal's metadata so followup proposals land in
+# the correct rig (not the hardcoded default). Proposals created by write-
+# followups stamp gc.rig; proposals filed via the dashboard's SeedModal
+# also stamp it via createProposal. If unset, fall back to park-manip for
+# backwards-compat with pre-rig-aware proposals.
+NEW_DEPTH=$((P_DEPTH + 1))
+P_RIG="${P_RIG:-park-manip}"
+if ! gc rig list --json 2>/dev/null | jq -e --arg rig "$P_RIG" '(.rigs[]?, .items[]?, .[]? | objects) | select(.name == $rig)' >/dev/null; then
+  echo "unknown rig '$P_RIG' on proposal $PROPOSAL_ID; refusing to promote"
+  FAIL_META=$(jq -n --arg rig "$P_RIG" \
+    '{"gc.decision":"promotion-failed","gc.decision_reason":"unknown rig","gc.rig":$rig}')
+  gc bd update "$PROPOSAL_ID" --metadata "$FAIL_META"
+  gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:promotion-failed
+  curator_decision_event "promotion-failed" "promotion failed for $PROPOSAL_ID: unknown rig $P_RIG" "$FAIL_META"
+  exit 1
+fi
+RIG_COORDINATOR="$P_RIG/workers.coordinator"
+case "$P_RIG" in
+  mjx-diffphysics) RIG_MAYOR="mjx-mayor" ;;
+  park-manip) RIG_MAYOR="park-mayor" ;;
+  robotics-bench) RIG_MAYOR="robotics-mayor" ;;
+  *) RIG_MAYOR="$P_RIG-mayor" ;;
+esac
+
+PAUSE_ROW=$(timeout 12s gc bd list --label kind:control --status open --limit 100 --json 2>/dev/null | jq -r --arg rig "$P_RIG" '
+  .[]? |
+  select((.labels // []) | index("control:curator")) |
+  select(.metadata["gc.control_type"] == "curator_pause") |
+  select(
+    .metadata["gc.pause_scope"] == "city" or
+    (.metadata["gc.pause_scope"] == "rig" and .metadata["gc.rig"] == $rig)
+  ) |
+  [.id, (.metadata["gc.reason"] // .title)] | @tsv
+' | head -1)
+if [ -n "$PAUSE_ROW" ]; then
+  echo "rig $P_RIG promotion paused by control bead: $PAUSE_ROW; leaving proposal pending"
+  gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:pending
+  exit 0
+fi
+
+# Lineage throttle, not capacity throttle: if a followup already has an active
+# child run from the same parent, hold siblings so the mayor/operator sees one
+# research step at a time and can choose the next branch after results land.
+if [ -n "$P_PARENT_RUN" ]; then
+  ACTIVE_SIBLING=$(timeout 12s gc bd list --metadata-field "gc.parent_run=$P_PARENT_RUN" --status open --limit 100 --json 2>/dev/null | jq -r \
+    --arg rig "$P_RIG" \
+    --arg parent "$P_PARENT_RUN" '
+    .[] |
+    select(.status == "open") |
+    select(.metadata["gc.rig"] == $rig) |
+    select(.metadata["gc.parent_run"] == $parent) |
+    select(.metadata["convergence.state"] == "active") |
+    .id
+  ' | head -1)
+  if [ -n "$ACTIVE_SIBLING" ]; then
+    echo "proposal $PROPOSAL_ID held: sibling run $ACTIVE_SIBLING is already active for parent $P_PARENT_RUN"
+    HOLD_META=$(jq -n --arg sibling "$ACTIVE_SIBLING" --arg parent "$P_PARENT_RUN" \
+      '{"gc.decision":"held-active-sibling","gc.decision_reason":"active sibling already running for parent","gc.active_sibling":$sibling,"gc.parent_run":$parent}')
+    gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+    gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:held-active-sibling
+    curator_decision_event "held-active-sibling" "held $PROPOSAL_ID because $ACTIVE_SIBLING is active" "$HOLD_META"
+    exit 0
+  fi
+fi
+
+# Method-family throttle: parallelism is useful across distinct methods, but
+# duplicate active runs in the same lane tend to hide failures and burn GPUs.
+# This uses Beads metadata as the registry, not an external run table.
+if [ -n "$P_METHOD_FAMILY" ]; then
+  ACTIVE_METHOD=$(timeout 12s gc bd list --status open --has-metadata-key convergence.state --limit 200 --json 2>/dev/null | jq -r \
+    --arg rig "$P_RIG" \
+    --arg method "$P_METHOD_FAMILY" '
+    .[]
+    | select(.metadata["convergence.state"] == "active")
+    | select((.metadata["gc.rig"] // .metadata["var.rig"] // "") == $rig)
+    | select((.metadata["gc.method_family"] // .metadata["gc.research_lane"] // "") == $method)
+    | .id
+  ' | head -1)
+  if [ -n "$ACTIVE_METHOD" ]; then
+    echo "proposal $PROPOSAL_ID held: method family $P_METHOD_FAMILY already active at $ACTIVE_METHOD"
+    HOLD_META=$(jq -n --arg active "$ACTIVE_METHOD" --arg method "$P_METHOD_FAMILY" \
+      '{"gc.decision":"held-active-method-family","gc.decision_reason":"active method family already running","gc.active_method_sibling":$active,"gc.method_family":$method,"gc.research_lane":$method}')
+    gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+    gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:held-active-method-family
+    curator_decision_event "held-active-method-family" "held $PROPOSAL_ID because method family $P_METHOD_FAMILY is active at $ACTIVE_METHOD" "$HOLD_META"
+    exit 0
+  fi
+fi
+
+set +e
+CREATE_OUTPUT=$("$HOME/bright-lights/assets/scripts/convergence/create_evaluate_idea.sh" \\
+  --title "$P_TITLE" \\
+  --idea "$P_TITLE" \\
+  --idea-description "$P_IDEA_DESC" \\
+  --rig "$P_RIG" \\
+  --max-iterations 3 \\
+  --proposal-id "$PROPOSAL_ID" \\
+  --lineage-root "${P_LINEAGE_ROOT:-}" \\
+  --parent-run "${P_PARENT_RUN:-}" \\
+  --lineage-depth "$NEW_DEPTH" \\
+  --thread-id "${P_THREAD_ID:-}" \\
+  --thread-title "${P_THREAD_TITLE:-}" \\
+  --followup-kind "$P_FOLLOWUP_KIND" \\
+  --thread-reason "${P_THREAD_REASON:-}" \\
+  --method-family "${P_METHOD_FAMILY:-}" 2>&1)
+CREATE_STATUS=$?
+set -e
+if [ "$CREATE_STATUS" -eq 75 ]; then
+  echo "proposal $PROPOSAL_ID held: $CREATE_OUTPUT"
+  ACTIVE_RIG_RUN=$(printf '%s\n' "$CREATE_OUTPUT" | awk '/^bl-[a-z0-9]+[[:space:]]/ {print $1; exit}')
+  HOLD_META=$(jq -n --arg reason "$CREATE_OUTPUT" --arg active "$ACTIVE_RIG_RUN" --arg rig "$P_RIG" \
+    '{"gc.decision":"held-active-rig","gc.decision_reason":$reason,"gc.active_rig_run":$active,"gc.rig":$rig}')
+  gc bd update "$PROPOSAL_ID" --metadata "$HOLD_META"
+  gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --add-label status:held --add-label status:held-active-rig
+  curator_decision_event "held-active-rig" "held $PROPOSAL_ID because rig already has active convergence" "$HOLD_META"
+  exit 0
+fi
+if [ "$CREATE_STATUS" -ne 0 ]; then
+  echo "promotion failed for $PROPOSAL_ID: $CREATE_OUTPUT"
+  FAIL_META=$(jq -n --arg status "$CREATE_STATUS" --arg reason "$CREATE_OUTPUT" \
+    '{"gc.decision":"promotion-failed","gc.decision_reason":$reason,"gc.create_status":$status}')
+  gc bd update "$PROPOSAL_ID" --metadata "$FAIL_META"
+  gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:promotion-failed
+  curator_decision_event "promotion-failed" "promotion failed for $PROPOSAL_ID" "$FAIL_META"
+  exit "$CREATE_STATUS"
+fi
+CREATE_JSON="$CREATE_OUTPUT"
+NEW_ROOT=$(printf '%s\n' "$CREATE_JSON" | jq -r '.root')
+THREAD_ID=$(printf '%s\n' "$CREATE_JSON" | jq -r '.thread_id')
+
+PROMOTE_META=$(jq -n \
+  --arg root "$NEW_ROOT" \
+  --arg depth "$NEW_DEPTH" \
+  --arg thread "$THREAD_ID" \
+  --arg kind "$P_FOLLOWUP_KIND" \
+  '{"gc.decision":"promoted","gc.promoted_to":$root,"gc.promoted_depth":$depth,"gc.thread_id":$thread,"gc.followup_kind":$kind}')
+gc bd update "$PROPOSAL_ID" --metadata "$PROMOTE_META"
+gc bd update "$PROPOSAL_ID" --remove-label status:dispatching --remove-label status:pending --add-label status:promoted
+curator_decision_event "promoted" "promoted $PROPOSAL_ID to $NEW_ROOT" "$PROMOTE_META"
+gc bd close "$PROPOSAL_ID" --reason "promoted to $NEW_ROOT" || true
+```
+
+## 5. Close the decide wisp
+
+This formula has only one step. Close your own wisp step bead when done.
+Do NOT close the proposal more than once, do NOT close any other convergence.
+"""

@@ -1,0 +1,5 @@
+[order]
+description = "Re-nudge routed convergence work whose worker session did not claim or finish cleanly."
+trigger = "cooldown"
+interval = "30s"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/nudge_stale_routed.sh"

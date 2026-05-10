@@ -1,0 +1,5 @@
+[order]
+description = "Use Gas City's built-in Dolt compaction command instead of custom compaction formulas/scripts."
+trigger = "cooldown"
+interval = "12h"
+exec = "cd /home/ubuntu/bright-lights && timeout 30m gc dolt compact"

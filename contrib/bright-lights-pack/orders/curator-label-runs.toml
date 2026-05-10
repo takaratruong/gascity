@@ -1,0 +1,5 @@
+[order]
+description = "On run closure, label terminated convergence runs (status:accepted / status:dead-end) so the dedup registry stays current."
+trigger = "cooldown"
+interval = "1m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/curator/label_runs.sh"

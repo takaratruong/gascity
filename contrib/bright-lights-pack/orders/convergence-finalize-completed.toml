@@ -1,0 +1,5 @@
+[order]
+description = "Close evaluate-idea coordinator steps whose review verdict/artifacts are complete but finalization stalled."
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/finalize_completed_iterations.sh"

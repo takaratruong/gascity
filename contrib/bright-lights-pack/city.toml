@@ -1,0 +1,36 @@
+[workspace]
+provider = "claude"
+
+[daemon]
+nudge_dispatcher = "supervisor"
+max_wakes_per_tick = 12
+probe_concurrency = 8
+
+[[rigs]]
+name = "park-manip"
+[rigs.imports]
+[rigs.imports.workers]
+source = "./assets/packs/rig-workers"
+
+[[rigs]]
+name = "mjx-diffphysics"
+prefix = "md"
+[rigs.imports]
+[rigs.imports.workers]
+source = "./assets/packs/rig-workers"
+
+[[rigs]]
+name = "robotics-bench"
+prefix = "rb"
+[rigs.imports]
+[rigs.imports.workers]
+source = "./assets/packs/rig-workers"
+
+[session_sleep]
+interactive_resume = "60s"
+interactive_fresh = "off"
+noninteractive = "0s"
+
+[convergence]
+max_per_agent = 100
+max_total = 0

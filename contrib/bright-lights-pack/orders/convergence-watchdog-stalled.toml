@@ -1,0 +1,5 @@
+[order]
+description = "Mark active convergence roots with no recent updates as status:stalled."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/watchdog_stalled.sh"

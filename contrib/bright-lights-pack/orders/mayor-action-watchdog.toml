@@ -1,0 +1,5 @@
+[order]
+description = "Ensure mayor chat directives become classified actions or linked work."
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ubuntu/bright-lights/assets/scripts/convergence/mayor_action_watchdog.sh"
