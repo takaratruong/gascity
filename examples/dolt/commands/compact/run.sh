@@ -11,8 +11,7 @@
 # This command replaces the formula-based mol-dog-compactor that was
 # routed to the dog pool. Per the formula's own ZFC-exemption notice,
 # compaction requires SQL access (database/sql) that agents don't have.
-# Running as an exec order (like dolt-gc-nudge) gives us direct SQL
-# access via the dolt CLI.
+# Running as an exec order gives us direct SQL access via the dolt CLI.
 #
 # Algorithm (flatten mode):
 #   1. Pre-flight: record row counts for all user tables.
@@ -37,9 +36,15 @@
 #   GC_DOLT_USER                          (default: root)
 #   GC_DOLT_PASSWORD                      (optional)
 #   GC_DOLT_COMPACT_THRESHOLD_COMMITS
-#     (default: 500) — skip databases with fewer commits than this.
+#     (default: 2000) — skip databases with fewer commits than this.
 #   GC_DOLT_COMPACT_CALL_TIMEOUT_SECS
 #     (default: 1800) — wall-clock bound for each SQL CALL.
+#   GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS
+#     (default: 120) — wall-clock bound for remote compare-and-push
+#                     after local compaction. Push failures fail the order.
+#   GC_DOLT_COMPACT_REMOTE               (optional) — remote to fetch/push.
+#                                         Defaults to origin when present;
+#                                         ambiguous multi-remote stores fail.
 #   GC_DOLT_COMPACT_DRY_RUN              (optional) — when set, prints
 #                                         what would happen but does not
 #                                         execute any DOLT_RESET / COMMIT.
@@ -111,8 +116,10 @@ fi
 : "${GC_DOLT_USER:=root}"
 
 host="${GC_DOLT_HOST:-127.0.0.1}"
-threshold_commits="${GC_DOLT_COMPACT_THRESHOLD_COMMITS:-500}"
+threshold_commits="${GC_DOLT_COMPACT_THRESHOLD_COMMITS:-2000}"
 call_timeout="${GC_DOLT_COMPACT_CALL_TIMEOUT_SECS:-1800}"
+push_timeout="${GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS:-120}"
+compact_remote="${GC_DOLT_COMPACT_REMOTE:-}"
 dry_run="${GC_DOLT_COMPACT_DRY_RUN:-}"
 only_dbs="${GC_DOLT_COMPACT_ONLY_DBS:-}"
 
@@ -128,6 +135,29 @@ case "$call_timeout" in
   ''|*[!0-9]*|0)
     printf 'compact: invalid GC_DOLT_COMPACT_CALL_TIMEOUT_SECS=%s (must be a positive integer)\n' \
       "$call_timeout" >&2
+    exit 2
+    ;;
+esac
+
+case "$push_timeout" in
+  ''|*[!0-9]*|0)
+    printf 'compact: invalid GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS=%s (must be a positive integer)\n' \
+      "$push_timeout" >&2
+    exit 2
+    ;;
+esac
+
+case "$compact_remote" in
+  ''|[A-Za-z0-9_.-]*)
+    case "$compact_remote" in
+      *[!A-Za-z0-9_.-]*)
+        printf 'compact: invalid GC_DOLT_COMPACT_REMOTE=%s\n' "$compact_remote" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    printf 'compact: invalid GC_DOLT_COMPACT_REMOTE=%s\n' "$compact_remote" >&2
     exit 2
     ;;
 esac
@@ -161,11 +191,11 @@ lock_dir="$lock_root/${lock_key}.dir"
 lock_pid_path="$lock_dir/pid"
 lock_cmd_path="$lock_dir/cmd"
 pending_gc_dir="$PACK_STATE_DIR/compact-pending-gc"
+pending_push_dir="$PACK_STATE_DIR/compact-pending-push"
 quarantine_dir="$PACK_STATE_DIR/compact-quarantine"
 
-# Same DB-discovery pattern as gc-nudge: rig metadata.json files first
-# (authoritative), with a filesystem-scan fallback when gc itself is
-# unavailable.
+# DB discovery uses rig metadata.json files first (authoritative), with a
+# filesystem-scan fallback when gc itself is unavailable.
 metadata_files() {
   printf '%s\n' "$GC_CITY_PATH/.beads/metadata.json"
   if command -v gc >/dev/null 2>&1; then
@@ -216,10 +246,10 @@ metadata_db() {
 }
 
 valid_database_name() {
-  db="$1"
-  case "$db" in
+  name="$1"
+  case "$name" in
     [A-Za-z0-9_]*)
-      case "$db" in
+      case "$name" in
         *[!A-Za-z0-9_-]*) return 1 ;;
         *) return 0 ;;
       esac
@@ -228,9 +258,22 @@ valid_database_name() {
   esac
 }
 
+valid_remote_name() {
+  remote_candidate="$1"
+  case "$remote_candidate" in
+    [A-Za-z0-9_.-]*)
+      case "$remote_candidate" in
+        *[!A-Za-z0-9_.-]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 is_system_database() {
-  name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  case "$name" in
+  system_candidate=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$system_candidate" in
     information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe) return 0 ;;
     *) return 1 ;;
   esac
@@ -335,7 +378,7 @@ user_tables() {
   out_tmp=$(mktemp)
   err_tmp=$(mktemp)
   if ! dolt_query "$db" \
-    "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_name NOT LIKE 'dolt\\_%' ESCAPE '\\\\' ORDER BY table_name" \
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_type = 'BASE TABLE' AND table_name NOT LIKE 'dolt\\_%' ESCAPE '\\\\' ORDER BY table_name" \
     > "$out_tmp" 2>"$err_tmp"; then
     printf 'compact: db=%s table list probe failed\n' "$db" >&2
     emit_error_file "$db" "$err_tmp"
@@ -358,6 +401,98 @@ db_value_hash() {
   db="$1"
   query_single_cell "$db" "database value hash probe failed" \
     "SELECT DOLT_HASHOF_DB()"
+}
+
+remote_count() {
+  db="$1"
+  query_single_cell "$db" "remote count probe failed" \
+    "SELECT COUNT(*) FROM dolt_remotes"
+}
+
+remote_exists() {
+  db="$1"
+  remote="$2"
+  query_single_cell "$db" "remote existence probe failed" \
+    "SELECT COUNT(*) FROM dolt_remotes WHERE name = '$remote'"
+}
+
+single_remote_name() {
+  db="$1"
+  query_single_cell "$db" "remote probe failed" \
+    "SELECT name FROM dolt_remotes ORDER BY name LIMIT 1"
+}
+
+select_remote() {
+  db="$1"
+
+  if [ -n "$compact_remote" ]; then
+    exists=$(remote_exists "$db" "$compact_remote") || return 1
+    if [ "$exists" != "1" ]; then
+      printf 'compact: db=%s configured remote=%s not found — fail\n' \
+        "$db" "$compact_remote" >&2
+      return 1
+    fi
+    printf '%s\n' "$compact_remote"
+    return 0
+  fi
+
+  count=$(remote_count "$db") || return 1
+  case "$count" in
+    ''|*[!0-9]*)
+      printf 'compact: db=%s remote count probe returned invalid value=%s\n' \
+        "$db" "$count" >&2
+      return 1
+      ;;
+  esac
+
+  if [ "$count" -eq 0 ]; then
+    printf '\n'
+    return 0
+  fi
+  if [ "$count" -eq 1 ]; then
+    single_remote_name "$db"
+    return $?
+  fi
+
+  origin_exists=$(remote_exists "$db" "origin") || return 1
+  if [ "$origin_exists" = "1" ]; then
+    printf 'origin\n'
+    return 0
+  fi
+  printf 'compact: db=%s multiple remotes found without origin; set GC_DOLT_COMPACT_REMOTE — fail\n' \
+    "$db" >&2
+  return 1
+}
+
+fetch_remote() {
+  db="$1"
+  remote="$2"
+  dolt_query "$db" "CALL DOLT_FETCH('$remote')"
+}
+
+remote_main_head() {
+  db="$1"
+  remote="$2"
+  query_single_cell "$db" "remote HEAD probe failed" \
+    "SELECT hash FROM dolt_remote_branches WHERE name = 'remotes/$remote/main'"
+}
+
+commit_exists_in_local_log() {
+  db="$1"
+  hash="$2"
+  query_single_cell "$db" "remote ancestry probe failed" \
+    "SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$hash'"
+}
+
+push_remote_main() {
+  db="$1"
+  remote="$2"
+  export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
+  run_bounded "$push_timeout" \
+    dolt --host "$host" --port "$GC_DOLT_PORT" \
+    --user "$GC_DOLT_USER" --no-tls \
+    --use-db "$db" \
+    sql -r tabular -q "CALL DOLT_PUSH('--force', '--set-upstream', '$remote', 'main')"
 }
 
 # preflight_counts — write "<table> <count>" lines for all user tables.
@@ -451,6 +586,7 @@ write_compact_marker() {
   dir="$1"
   db="$2"
   reason="$3"
+  shift 3
 
   old_umask=$(umask)
   umask 077
@@ -470,6 +606,10 @@ write_compact_marker() {
     printf 'db=%s\n' "$db"
     printf 'reason=%s\n' "$reason"
     printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    while [ "$#" -gt 0 ]; do
+      printf '%s\n' "$1"
+      shift
+    done
   } > "$tmp" || {
     rm -f "$tmp"
     printf 'compact: db=%s unable to write marker %s\n' "$db" "$tmp" >&2
@@ -482,6 +622,15 @@ write_compact_marker() {
     return 1
   fi
   return 0
+}
+
+compact_marker_value() {
+  dir="$1"
+  db="$2"
+  key="$3"
+  marker=$(compact_marker_path "$dir" "$db")
+  [ -f "$marker" ] || return 1
+  awk -v prefix="$key=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' "$marker"
 }
 
 clear_compact_marker() {
@@ -516,20 +665,80 @@ run_full_gc() {
   return 0
 }
 
-restore_head_after_flatten_failure() {
+push_remote_after_compaction() {
+  db="$1"
+  remote="$2"
+  expected_remote_head="$3"
+  [ -n "$remote" ] || return 0
+
+  fetch_rc=0
+  fetch_err_tmp=$(mktemp)
+  fetch_remote "$db" "$remote" >/dev/null 2>"$fetch_err_tmp" || fetch_rc=$?
+  if [ "$fetch_rc" -ne 0 ]; then
+    printf 'compact: db=%s remote=%s fetch failed rc=%s before push after local compaction\n' \
+      "$db" "$remote" "$fetch_rc" >&2
+    emit_error_file "$db" "$fetch_err_tmp"
+    rm -f "$fetch_err_tmp"
+    write_compact_marker "$pending_push_dir" "$db" "flatten and full GC succeeded but remote fetch before push failed" || true
+    return 1
+  fi
+  rm -f "$fetch_err_tmp"
+
+  if ! latest_remote_head=$(remote_main_head "$db" "$remote"); then
+    printf 'compact: db=%s remote=%s HEAD probe failed before push after local compaction\n' \
+      "$db" "$remote" >&2
+    write_compact_marker "$pending_push_dir" "$db" "flatten and full GC succeeded but remote HEAD probe before push failed" || true
+    return 1
+  fi
+  if [ -n "$latest_remote_head" ]; then
+    case "$latest_remote_head" in
+      *[!A-Za-z0-9]*)
+        printf 'compact: db=%s remote=%s returned invalid HEAD=%s before push — fail\n' \
+          "$db" "$remote" "$latest_remote_head" >&2
+        write_compact_marker "$pending_push_dir" "$db" "flatten and full GC succeeded but remote HEAD before push was invalid" || true
+        return 1
+        ;;
+    esac
+  fi
+  if [ "$latest_remote_head" != "$expected_remote_head" ]; then
+    printf 'compact: db=%s remote=%s HEAD changed before push expected_HEAD=%s got_HEAD=%s — leaving local compaction pending remote repair\n' \
+      "$db" "$remote" "${expected_remote_head:-<empty>}" "${latest_remote_head:-<empty>}" >&2
+    write_compact_marker "$pending_push_dir" "$db" "flatten and full GC succeeded but remote HEAD changed before push" || true
+    return 1
+  fi
+
+  push_rc=0
+  push_err_tmp=$(mktemp)
+  push_remote_main "$db" "$remote" >/dev/null 2>"$push_err_tmp" || push_rc=$?
+  if [ "$push_rc" -ne 0 ]; then
+    printf 'compact: db=%s remote=%s push failed rc=%s after local compaction\n' \
+      "$db" "$remote" "$push_rc" >&2
+    emit_error_file "$db" "$push_err_tmp"
+    rm -f "$push_err_tmp"
+    write_compact_marker "$pending_push_dir" "$db" "flatten and full GC succeeded but remote push failed" || true
+    return 1
+  fi
+  rm -f "$push_err_tmp"
+  clear_compact_marker "$pending_push_dir" "$db"
+  printf 'compact: db=%s remote=%s pushed compacted main\n' "$db" "$remote"
+  return 0
+}
+
+restore_head_if_current() {
   db="$1"
   head="$2"
-  root="$3"
+  expected_current="$3"
+  reason="$4"
 
   current_head=$(head_commit "$db" || true)
   if [ "$current_head" = "$head" ]; then
-    printf 'compact: db=%s already at pre-flatten HEAD=%s after flatten failure\n' \
-      "$db" "$head" >&2
+    printf 'compact: db=%s already at pre-flatten HEAD=%s after %s\n' \
+      "$db" "$head" "$reason" >&2
     return 0
   fi
-  if [ "$current_head" != "$root" ]; then
-    printf 'compact: db=%s current HEAD=%s is neither pre-flatten HEAD=%s nor compactor reset root=%s — refusing hard reset; manual repair required\n' \
-      "$db" "${current_head:-<empty>}" "$head" "$root" >&2
+  if [ "$current_head" != "$expected_current" ]; then
+    printf 'compact: db=%s current HEAD=%s is neither pre-flatten HEAD=%s nor expected recovery HEAD=%s after %s — refusing hard reset; manual repair required\n' \
+      "$db" "${current_head:-<empty>}" "$head" "$expected_current" "$reason" >&2
     return 1
   fi
 
@@ -547,12 +756,31 @@ restore_head_after_flatten_failure() {
 
   restored_head=$(head_commit "$db" || true)
   if [ "$restored_head" != "$head" ]; then
-    printf 'compact: db=%s restore verification failed want_HEAD=%s got_HEAD=%s — manual repair required\n' \
-      "$db" "$head" "${restored_head:-<empty>}" >&2
+    printf 'compact: db=%s restore verification failed want_HEAD=%s got_HEAD=%s after %s — manual repair required\n' \
+      "$db" "$head" "${restored_head:-<empty>}" "$reason" >&2
     return 1
   fi
-  printf 'compact: db=%s restored pre-flatten HEAD=%s after flatten failure\n' \
-    "$db" "$head" >&2
+  printf 'compact: db=%s restored pre-flatten HEAD=%s after %s\n' \
+    "$db" "$head" "$reason" >&2
+  return 0
+}
+
+restore_head_after_flatten_failure() {
+  db="$1"
+  head="$2"
+  root="$3"
+  restore_head_if_current "$db" "$head" "$root" "flatten failure"
+}
+
+preserve_head_after_integrity_failure() {
+  db="$1"
+  flatten_head="$3"
+  current_head=$(head_commit "$db" || true)
+  if [ -z "$current_head" ]; then
+    current_head="$flatten_head"
+  fi
+  printf 'compact: db=%s leaving post-flatten HEAD=%s in place after integrity failure; manual repair required before compaction or GC to avoid discarding possible writer data\n' \
+    "$db" "${current_head:-<empty>}" >&2
   return 0
 }
 
@@ -575,16 +803,39 @@ flatten_database() {
     return 1
   fi
 
+  if has_compact_marker "$pending_push_dir" "$db"; then
+    printf 'compact: db=%s pending remote push marker exists — manual intervention required before compaction or GC\n' \
+      "$db" >&2
+    return 1
+  fi
+
   if has_compact_marker "$pending_gc_dir" "$db"; then
     if [ -n "$dry_run" ]; then
       printf 'compact: db=%s pending_gc=present — dry-run (would retry DOLT_GC --full)\n' "$db"
       return 0
     fi
+    pending_remote=$(compact_marker_value "$pending_gc_dir" "$db" remote || true)
+    pending_expected_remote_head=$(compact_marker_value "$pending_gc_dir" "$db" expected_remote_head || true)
+    if [ -n "$pending_remote" ] && ! valid_remote_name "$pending_remote"; then
+      printf 'compact: db=%s pending_gc marker has invalid remote=%s — manual intervention required\n' \
+        "$db" "$pending_remote" >&2
+      return 1
+    fi
+    if [ -n "$pending_expected_remote_head" ]; then
+      case "$pending_expected_remote_head" in
+        *[!A-Za-z0-9]*)
+          printf 'compact: db=%s pending_gc marker has invalid expected_remote_head=%s — manual intervention required\n' \
+            "$db" "$pending_expected_remote_head" >&2
+          return 1
+          ;;
+      esac
+    fi
     printf 'compact: db=%s pending_gc=present — retrying DOLT_GC --full\n' "$db"
     start=$(date +%s)
     if run_full_gc "$db" "pending-GC retry" "pending-GC retry" "$start"; then
       clear_compact_marker "$pending_gc_dir" "$db"
-      return 0
+      push_remote_after_compaction "$db" "$pending_remote" "$pending_expected_remote_head"
+      return $?
     fi
     return 1
   fi
@@ -630,6 +881,64 @@ flatten_database() {
     printf 'compact: db=%s commits=%s root=%s — dry-run (would flatten)\n' \
       "$db" "$count" "$root"
     return 0
+  fi
+
+  remote=""
+  expected_remote_head=""
+  if probed_remote=$(select_remote "$db"); then
+    remote="$probed_remote"
+  else
+    printf 'compact: db=%s remote selection failed — fail\n' "$db" >&2
+    return 1
+  fi
+  if [ -n "$remote" ]; then
+    if ! valid_remote_name "$remote"; then
+      printf 'compact: db=%s invalid remote name=%s — fail\n' "$db" "$remote" >&2
+      return 1
+    fi
+
+    printf 'compact: db=%s remote=%s — fetching before flatten...\n' "$db" "$remote"
+    fetch_rc=0
+    fetch_err_tmp=$(mktemp)
+    fetch_remote "$db" "$remote" >/dev/null 2>"$fetch_err_tmp" || fetch_rc=$?
+    if [ "$fetch_rc" -ne 0 ]; then
+      printf 'compact: db=%s remote=%s fetch failed rc=%s — aborting before flatten\n' \
+        "$db" "$remote" "$fetch_rc" >&2
+      emit_error_file "$db" "$fetch_err_tmp"
+      rm -f "$fetch_err_tmp"
+      return 1
+    else
+      if ! remote_head=$(remote_main_head "$db" "$remote"); then
+        rm -f "$fetch_err_tmp"
+        return 1
+      fi
+      expected_remote_head="$remote_head"
+      if [ -n "$remote_head" ] && [ "$remote_head" != "$head" ]; then
+        case "$remote_head" in
+          *[!A-Za-z0-9]*)
+            printf 'compact: db=%s remote=%s returned invalid HEAD=%s — fail\n' \
+              "$db" "$remote" "$remote_head" >&2
+            rm -f "$fetch_err_tmp"
+            return 1
+            ;;
+        esac
+        if ! in_local=$(commit_exists_in_local_log "$db" "$remote_head"); then
+          rm -f "$fetch_err_tmp"
+          return 1
+        fi
+        if [ "$in_local" != "1" ]; then
+          printf 'compact: db=%s remote=%s remote HEAD=%s is not in local history — aborting before flatten\n' \
+            "$db" "$remote" "$remote_head" >&2
+          rm -f "$fetch_err_tmp"
+          return 1
+        else
+          printf 'compact: db=%s remote=%s fetch ok\n' "$db" "$remote"
+        fi
+      else
+        printf 'compact: db=%s remote=%s fetch ok\n' "$db" "$remote"
+      fi
+    fi
+    rm -f "$fetch_err_tmp"
   fi
 
   preflight_tmp=$(mktemp)
@@ -681,11 +990,21 @@ flatten_database() {
   fi
   rm -f "$reset_err_tmp"
 
+  flatten_head=$(head_commit "$db" || true)
+  if [ -z "$flatten_head" ]; then
+    printf 'compact: db=%s post-flatten HEAD probe failed — quarantine and investigate before GC\n' \
+      "$db" >&2
+    write_compact_marker "$quarantine_dir" "$db" "post-flatten HEAD probe failed" || true
+    rm -f "$preflight_tmp"
+    return 1
+  fi
+
   post_hash=$(db_value_hash "$db" || true)
   if [ -z "$post_hash" ]; then
     printf 'compact: db=%s post-flatten database value hash probe failed — quarantine and investigate before GC\n' \
       "$db" >&2
     write_compact_marker "$quarantine_dir" "$db" "post-flatten database value hash probe failed" || true
+    preserve_head_after_integrity_failure "$db" "$head" "$flatten_head" || true
     rm -f "$preflight_tmp"
     return 1
   fi
@@ -693,6 +1012,7 @@ flatten_database() {
     printf 'compact: db=%s value hash changed after flatten before_hash=%s after_hash=%s — quarantine and investigate before GC\n' \
       "$db" "$preflight_hash" "$post_hash" >&2
     write_compact_marker "$quarantine_dir" "$db" "post-flatten value hash changed" || true
+    preserve_head_after_integrity_failure "$db" "$head" "$flatten_head" || true
     rm -f "$preflight_tmp"
     return 1
   fi
@@ -701,6 +1021,7 @@ flatten_database() {
     printf 'compact: db=%s post-flatten INTEGRITY check failed — escalate (row counts diverged; investigate before re-running)\n' \
       "$db" >&2
     write_compact_marker "$quarantine_dir" "$db" "post-flatten row count changed" || true
+    preserve_head_after_integrity_failure "$db" "$head" "$flatten_head" || true
     rm -f "$preflight_tmp"
     return 1
   fi
@@ -711,14 +1032,15 @@ flatten_database() {
   # CALL DOLT_GC() alone only reclaims working-set chunks — the bulk of
   # the orphaned history lives in noms/oldgen/ archives that require
   # --full to rewrite. Since flatten always orphans the entire prior
-  # commit graph, --full is always appropriate here (unlike the hourly
-  # gc-nudge which uses the cheaper default GC).
+  # commit graph, --full is always appropriate here.
   if run_full_gc "$db" "flatten ok commits=$count->${after_count:-?} but" \
     "commits=$count->${after_count:-?}" "$start"; then
     clear_compact_marker "$pending_gc_dir" "$db"
-    return 0
+    push_remote_after_compaction "$db" "$remote" "$expected_remote_head"
+    return $?
   fi
-  write_compact_marker "$pending_gc_dir" "$db" "flatten succeeded but full GC failed" || true
+  write_compact_marker "$pending_gc_dir" "$db" "flatten succeeded but full GC failed" \
+    "remote=$remote" "expected_remote_head=$expected_remote_head" || true
   return 1
 }
 
