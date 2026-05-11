@@ -18,10 +18,27 @@ json_or_empty() {
   "$@" 2>/dev/null || printf '[]'
 }
 
-status="$(timeout 12s gc status 2>/dev/null || true)"
-[[ "$status" == *"Controller: supervisor-managed"* ]] || fail "controller is not supervisor-managed/running"
-[[ "$status" == *"Suspended:  no"* ]] || fail "city is suspended"
-[[ "$status" == *"$RIG"* ]] || fail "rig $RIG not visible in gc status"
+status_json="$(timeout 20s gc status --json 2>/dev/null || true)"
+if printf '%s\n' "$status_json" | jq -e '.controller.running == true and .controller.mode == "supervisor"' >/dev/null 2>&1; then
+  :
+else
+  supervisor_status="$(timeout 12s gc supervisor status 2>/dev/null || true)"
+  if printf '%s\n' "$supervisor_status" | grep -q 'Supervisor is running'; then
+    warn "gc status --json did not report supervisor mode, but gc supervisor status is running"
+  else
+    fail "controller is not supervisor-managed/running"
+  fi
+fi
+if printf '%s\n' "$status_json" | jq -e '.suspended == false' >/dev/null 2>&1; then
+  :
+else
+  fail "city is suspended"
+fi
+if printf '%s\n' "$status_json" | jq -e --arg rig "$RIG" '[.rigs[]? | select(.name == $rig and (.suspended // false) == false)] | length > 0' >/dev/null 2>&1; then
+  :
+else
+  fail "rig $RIG not visible in gc status"
+fi
 
 active_json="$(json_or_empty timeout 12s gc bd list --status open --has-metadata-key convergence.state --limit 200 --json)"
 active_count="$(printf '%s\n' "$active_json" | jq --arg rig "$RIG" '[.[] | select((.metadata["gc.rig"] // .metadata["var.rig"] // "") == $rig) | select(.metadata["convergence.state"] == "active" or .metadata["convergence.state"] == "creating")] | length')"

@@ -44,6 +44,14 @@ validate_attempt() {
     reason="missing required implementation.md, metrics.json, or metrics.md"
   fi
 
+  if [ -z "$reason" ] && [ -f "$attempt_dir/metrics.json" ]; then
+    local capacity_blocked
+    capacity_blocked="$(jq -r '(.capacity_blocked == true) or ((.device // "") | test("capacity-blocked"))' "$attempt_dir/metrics.json" 2>/dev/null || echo false)"
+    if [ "$capacity_blocked" = "true" ]; then
+      reason="capacity-blocked: no free GPU available; see gpu_processes.csv"
+    fi
+  fi
+
   if [ -z "$reason" ] && [ "$rig" = "mjx-diffphysics" ]; then
     if [ ! -s "$attempt_dir/progress.jsonl" ]; then
       reason="mjx-diffphysics attempt missing progress.jsonl heartbeat"

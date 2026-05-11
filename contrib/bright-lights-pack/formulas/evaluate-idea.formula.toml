@@ -385,7 +385,17 @@ EOF
     break
   fi
 
-  gc bd update "$IMPL_BEAD" --set-metadata gc.validation=failed --append-notes "Attempt $ATTEMPT failed coordinator validation: $(cat "$ATTEMPT_RUN_DIR/validation_failed.txt" 2>/dev/null)" >/dev/null 2>&1 || true
+  VALIDATION_REASON="$(cat "$ATTEMPT_RUN_DIR/validation_failed.txt" 2>/dev/null || true)"
+  gc bd update "$IMPL_BEAD" --set-metadata gc.validation=failed --append-notes "Attempt $ATTEMPT failed coordinator validation: $VALIDATION_REASON" >/dev/null 2>&1 || true
+  if printf '%s\n' "$VALIDATION_REASON" | grep -qi '^capacity-blocked:'; then
+    echo "CAPACITY_BLOCKED: no free GPU for attempt $ATTEMPT; ending this coordinator step without burning more attempts"
+    gc bd update "$ROOT_DIR_ID" \
+      --set-metadata gc.result_class=INFRA_BLOCKED \
+      --set-metadata gc.failure_class=gpu-capacity-blocked \
+      --set-metadata gc.capacity_blocked_at="$(date -Is)" \
+      --set-metadata gc.capacity_blocked_attempt="$IMPL_BEAD" >/dev/null 2>&1 || true
+    exit 75
+  fi
 done
 
 if [ -z "$SELECTED_ATTEMPT_DIR" ]; then

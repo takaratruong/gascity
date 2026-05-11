@@ -94,6 +94,7 @@ fi
     printf '\n'
   } >> "$log"
   start_epoch="$(date +%s)"
+  export GC_ATTEMPT_DIR="$attempt_dir"
   if [ "${argv[0]:-}" = "bash" ] && [ "${argv[1]:-}" = "-lc" ] && [ "${#argv[@]}" -ge 3 ]; then
     # Attempts commonly tee logs. Without pipefail, `timeout cmd | tee log`
     # exits with tee's status and can mark killed runs as successful.
