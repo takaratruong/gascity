@@ -386,25 +386,50 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	}
 
 	// Adoption barrier: ensure every running session has a bead.
-	// Runs on every startup (rerunnable, crash-safe).
+	// Runs on every startup (rerunnable, crash-safe). Keep this bounded:
+	// if provider/store calls wedge here, the city remains half-started and
+	// boot-time orders can continue to pressure the bead store.
 	adoptionComplete := false
 	if !retryStartupStep("adoption-barrier", func() bool { return adoptionComplete }, func() {
 		if cr.onStatus != nil {
 			cr.onStatus("adopting_sessions")
 		}
-		if cr.cityBeadStore() != nil {
-			result, passed := runAdoptionBarrier(cr.cityBeadStore(), cr.sp, cr.cfg, cr.cityName, clock.Real{}, cr.stderr, false)
-			if result.Adopted > 0 {
-				fmt.Fprintf(cr.stdout, "Adopted %d running session(s) into bead store.\n", result.Adopted) //nolint:errcheck
+		type adoptionBarrierResponse struct {
+			result adoptionResult
+			passed bool
+		}
+		respCh := make(chan adoptionBarrierResponse, 1)
+		go func() {
+			store := cr.cityBeadStore()
+			if store == nil {
+				respCh <- adoptionBarrierResponse{passed: true}
+				return
 			}
-			if !passed {
-				// Sessions that fail adoption AND have no matching agent are
-				// invisible to the bead reconciler (which only processes beaded
-				// sessions). They will be cleaned up when they naturally exit.
-				// Sessions with matching agents get beads via syncSessionBeads
-				// on the next tick.
-				fmt.Fprintf(cr.stderr, "%s: adoption barrier: %d session(s) failed bead creation\n", cr.logPrefix, result.Skipped) //nolint:errcheck
-			}
+			result, passed := runAdoptionBarrier(store, cr.sp, cr.cfg, cr.cityName, clock.Real{}, cr.stderr, false)
+			respCh <- adoptionBarrierResponse{result: result, passed: passed}
+		}()
+		var result adoptionResult
+		var passed bool
+		select {
+		case resp := <-respCh:
+			result = resp.result
+			passed = resp.passed
+		case <-time.After(15 * time.Second):
+			fmt.Fprintf(cr.stderr, "%s: adoption barrier timed out after 15s; continuing startup and leaving reconciliation to the session tick\n", cr.logPrefix) //nolint:errcheck
+			passed = true
+		case <-ctx.Done():
+			return
+		}
+		if result.Adopted > 0 {
+			fmt.Fprintf(cr.stdout, "Adopted %d running session(s) into bead store.\n", result.Adopted) //nolint:errcheck
+		}
+		if !passed {
+			// Sessions that fail adoption AND have no matching agent are
+			// invisible to the bead reconciler (which only processes beaded
+			// sessions). They will be cleaned up when they naturally exit.
+			// Sessions with matching agents get beads via syncSessionBeads
+			// on the next tick.
+			fmt.Fprintf(cr.stderr, "%s: adoption barrier: %d session(s) failed bead creation\n", cr.logPrefix, result.Skipped) //nolint:errcheck
 		}
 		adoptionComplete = true
 	}) {
